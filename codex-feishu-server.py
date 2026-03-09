@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import asyncio
 import json
 import os
@@ -14,6 +15,7 @@ from typing import Any
 
 from loguru import logger
 
+from codex_app_server import CodexAppServerRunner
 from config import APP_ID, APP_SECRET
 from feishu_bot import FeishuAttachment, FeishuBot, FeishuInboundMessage, IMAGE_SUFFIXES
 
@@ -35,12 +37,69 @@ RECENT_ARTIFACT_SUFFIXES = IMAGE_SUFFIXES | {
     ".md",
     ".json",
 }
+BLOCKED_ARTIFACT_SUFFIXES = {
+    ".py",
+    ".pyi",
+    ".ipynb",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".java",
+    ".kt",
+    ".kts",
+    ".scala",
+    ".go",
+    ".rs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hpp",
+    ".m",
+    ".mm",
+    ".swift",
+    ".rb",
+    ".php",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+    ".bat",
+    ".cmd",
+    ".pl",
+    ".pm",
+    ".lua",
+    ".r",
+    ".jl",
+    ".dart",
+    ".ex",
+    ".exs",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+    ".lock",
+}
 IGNORE_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}
 ARTIFACT_LINE_RE = re.compile(r"^(MEDIA|FILE):\s*(.+?)\s*$", re.IGNORECASE)
 COMMAND_OUTPUT_PREVIEW = 1200
 MESSAGE_PREVIEW_LIMIT = 160
 INPUT_BUNDLE_IDLE_SECONDS = 8.0
 INPUT_BUNDLE_MAX_WAIT_SECONDS = 20.0
+DEFAULT_SHOW_PROGRESS = True
+DEFAULT_PROGRESS_DELAY_SECONDS = 8.0
+DEFAULT_PROGRESS_FORCE_SHOW_SECONDS = 15.0
+DEFAULT_PROGRESS_KEEPALIVE_SECONDS = 3.0
+DEFAULT_APP_SERVER_IDLE_TIMEOUT_SECONDS = 900.0
+PROGRESS_UPDATE_MIN_INTERVAL_SECONDS = 1.2
 
 
 @dataclass(slots=True)
@@ -53,6 +112,11 @@ class RouteConfig:
     codex_args: list[str] = field(default_factory=list)
     auto_send_recent_artifacts: bool = True
     max_auto_artifacts: int = 3
+    show_progress: bool = DEFAULT_SHOW_PROGRESS
+    progress_delay_seconds: float = DEFAULT_PROGRESS_DELAY_SECONDS
+    progress_force_show_seconds: float = DEFAULT_PROGRESS_FORCE_SHOW_SECONDS
+    progress_keepalive_seconds: float = DEFAULT_PROGRESS_KEEPALIVE_SECONDS
+    app_server_idle_timeout_seconds: float = DEFAULT_APP_SERVER_IDLE_TIMEOUT_SECONDS
 
 
 @dataclass(slots=True)
@@ -91,6 +155,29 @@ class InputBundle:
     due_at: float = 0.0
     generation: int = 0
     flush_task: asyncio.Task[Any] | None = None
+
+
+@dataclass(slots=True)
+class ProgressCardState:
+    task_key: str
+    reply_target: str
+    route_name: str
+    workdir: str
+    message_preview: str
+    started_at: float
+    show_delay_seconds: float = DEFAULT_PROGRESS_DELAY_SECONDS
+    force_show_seconds: float = DEFAULT_PROGRESS_FORCE_SHOW_SECONDS
+    keepalive_seconds: float = DEFAULT_PROGRESS_KEEPALIVE_SECONDS
+    status: str = "任务已启动，正在等待 Codex 建立上下文。"
+    visible: bool = False
+    done: bool = False
+    message_id: str | None = None
+    last_render_key: str = ""
+    last_render_at: float = 0.0
+    show_task: asyncio.Task[Any] | None = None
+    keepalive_task: asyncio.Task[Any] | None = None
+    render_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    has_meaningful_activity: bool = False
 
 
 class RouteTable:
@@ -150,6 +237,43 @@ class RouteTable:
                 max_auto_artifacts=max(
                     0,
                     int(entry.get("max_auto_artifacts") or defaults.get("max_auto_artifacts") or 3),
+                ),
+                show_progress=bool(entry.get("show_progress", defaults.get("show_progress", DEFAULT_SHOW_PROGRESS))),
+                progress_delay_seconds=max(
+                    0.0,
+                    float(
+                        entry.get(
+                            "progress_delay_seconds",
+                            defaults.get("progress_delay_seconds", DEFAULT_PROGRESS_DELAY_SECONDS),
+                        )
+                    ),
+                ),
+                progress_force_show_seconds=max(
+                    8.0,
+                    float(
+                        entry.get(
+                            "progress_force_show_seconds",
+                            defaults.get("progress_force_show_seconds", DEFAULT_PROGRESS_FORCE_SHOW_SECONDS),
+                        )
+                    ),
+                ),
+                progress_keepalive_seconds=max(
+                    2.0,
+                    float(
+                        entry.get(
+                            "progress_keepalive_seconds",
+                            defaults.get("progress_keepalive_seconds", DEFAULT_PROGRESS_KEEPALIVE_SECONDS),
+                        )
+                    ),
+                ),
+                app_server_idle_timeout_seconds=max(
+                    0.0,
+                    float(
+                        entry.get(
+                            "app_server_idle_timeout_seconds",
+                            defaults.get("app_server_idle_timeout_seconds", DEFAULT_APP_SERVER_IDLE_TIMEOUT_SECONDS),
+                        )
+                    ),
                 ),
             )
             if not os.path.isdir(route.workdir):
@@ -390,7 +514,7 @@ class SessionStore:
         return entry if isinstance(entry, dict) else None
 
 
-class CodexRunner:
+class CodexExecRunner:
     def __init__(self, default_bin: str = "codex"):
         self.default_bin = default_bin
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
@@ -405,6 +529,7 @@ class CodexRunner:
         image_paths: list[str],
         run_key: str | None = None,
         on_progress: callable | None = None,
+        developer_instructions: str | None = None,
     ) -> CodexRunResult:
         output_path = None
         env = os.environ.copy()
@@ -432,7 +557,10 @@ class CodexRunner:
             if run_key:
                 self._active_processes[run_key] = proc
 
+            last_command_preview = ""
+
             async def read_stdout() -> None:
+                nonlocal last_command_preview
                 nonlocal resolved_session_id
                 assert proc.stdout is not None
                 while True:
@@ -458,6 +586,15 @@ class CodexRunner:
                                 await on_progress("上下文接好了，我开始动手。")
                     elif event_type == "turn.started" and on_progress:
                         await on_progress("我正在项目里翻代码、跑命令。")
+                    elif event_type == "item.completed" and on_progress:
+                        item = event.get("item")
+                        if isinstance(item, dict) and item.get("type") == "command_execution":
+                            command = re.sub(r"\s+", " ", str(item.get("command") or "")).strip()
+                            if command:
+                                preview = command[:80] + ("…" if len(command) > 80 else "")
+                                if preview != last_command_preview:
+                                    last_command_preview = preview
+                                    await on_progress(f"刚执行命令：`{preview}`")
                     elif event_type == "error":
                         message = str(event.get("message", "")).strip()
                         if on_progress and message and not message.startswith("Reconnecting..."):
@@ -580,6 +717,70 @@ class CodexRunner:
         return last_message
 
 
+class CodexRunner:
+    def __init__(self, default_bin: str = "codex", backend: str = "exec"):
+        self.default_bin = default_bin
+        self.backend = backend
+        self._exec_runner = CodexExecRunner(default_bin=default_bin)
+        self._app_server_runner = CodexAppServerRunner(default_bin=default_bin)
+
+    async def run(
+        self,
+        *,
+        prompt: str,
+        route: RouteConfig,
+        session_id: str | None,
+        image_paths: list[str],
+        run_key: str | None = None,
+        on_progress: callable | None = None,
+        developer_instructions: str | None = None,
+    ) -> CodexRunResult:
+        if self.backend == "app_server":
+            result = await self._app_server_runner.run(
+                prompt=prompt,
+                route=route,
+                session_id=session_id,
+                image_paths=image_paths,
+                run_key=run_key,
+                on_progress=on_progress,
+                developer_instructions=developer_instructions,
+            )
+            return CodexRunResult(
+                output=result.output,
+                session_id=result.session_id,
+                success=result.success,
+                interrupted=result.interrupted,
+                event_lines=result.event_lines,
+            )
+        return await self._exec_runner.run(
+            prompt=prompt,
+            route=route,
+            session_id=session_id,
+            image_paths=image_paths,
+            run_key=run_key,
+            on_progress=on_progress,
+            developer_instructions=developer_instructions,
+        )
+
+    async def interrupt(self, run_key: str) -> bool:
+        if self.backend == "app_server":
+            return await self._app_server_runner.interrupt(run_key)
+        return await self._exec_runner.interrupt(run_key)
+
+    async def release_route(self, route_name: str) -> bool:
+        if self.backend == "app_server":
+            return await self._app_server_runner.release_route(route_name)
+        return False
+
+    def route_status(self, route_name: str) -> dict[str, Any] | None:
+        if self.backend == "app_server":
+            return self._app_server_runner.route_status(route_name)
+        return None
+
+    async def close(self) -> None:
+        await self._app_server_runner.close()
+
+
 class MultiRouteCodexFeishuService:
     def __init__(
         self,
@@ -587,18 +788,21 @@ class MultiRouteCodexFeishuService:
         routes_path: str,
         session_store_path: str,
         codex_bin: str,
+        backend: str,
         state_dir: str,
         legacy_session_store: str | None,
     ):
         self.routes = RouteTable(routes_path)
         self.bot = FeishuBot(APP_ID, APP_SECRET)
         self.sessions = SessionStore(session_store_path, self.routes, legacy_session_store)
-        self.runner = CodexRunner(default_bin=codex_bin)
+        self.backend = backend
+        self.runner = CodexRunner(default_bin=codex_bin, backend=backend)
         self.state_dir = Path(state_dir).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._active_tasks: dict[str, bool] = {}
         self._pending_messages: dict[str, deque[FeishuInboundMessage]] = {}
         self._running_meta: dict[str, dict[str, Any]] = {}
+        self._progress_cards: dict[str, ProgressCardState] = {}
         self._input_bundles: dict[str, InputBundle] = {}
         self._dispatch_lock = asyncio.Lock()
         self._bundle_lock = asyncio.Lock()
@@ -606,9 +810,13 @@ class MultiRouteCodexFeishuService:
 
     async def start(self) -> None:
         logger.info("Starting FlyingCodex with {} route(s)", len(self.routes.routes_by_name))
+        logger.info("Backend mode: {}", self.backend)
         for line in self.routes.summary_lines():
             logger.info(line)
         await self.bot.start()
+
+    async def shutdown(self) -> None:
+        await self.runner.close()
 
     async def _handle_message(self, message: FeishuInboundMessage) -> None:
         route = self.routes.resolve(message.chat_id)
@@ -643,6 +851,7 @@ class MultiRouteCodexFeishuService:
         if command in {"/interrupt", "/stop", "/cancel"}:
             stopped = await self.runner.interrupt(task_key)
             if stopped:
+                await self._update_progress_status(task_key, "已发送中断信号，正在等待 Codex 收尾。", force=True)
                 pending_count = len(self._pending_messages.get(task_key) or ())
                 text = "当前正在跑的任务已发送中断信号。"
                 if pending_count:
@@ -675,6 +884,13 @@ class MultiRouteCodexFeishuService:
                 message.reply_target,
                 f"已丢弃待补充输入（{len(dropped_bundle.texts)} 段文字，{len(dropped_bundle.attachments)} 个附件）。",
             )
+            return
+        if command == "/release":
+            released = await self.runner.release_route(route.name)
+            if released:
+                await self.bot.send_text(message.reply_target, "当前项目的常驻 Codex 进程已释放；下次有新消息时会自动重建。")
+            else:
+                await self.bot.send_text(message.reply_target, "当前没有可释放的常驻 Codex 进程。")
             return
         if command in {"/new", "/reset"}:
             if self._active_tasks.get(task_key):
@@ -888,13 +1104,22 @@ class MultiRouteCodexFeishuService:
     ) -> None:
         started_at = time.time()
         downloads_dir = self.state_dir / "downloads" / route.name / self._scope_dir_name(scope_key)
+        initial_progress = "任务已启动，正在等待 Codex 建立上下文。"
         self._running_meta[task_key] = {
             "started_at": int(started_at),
             "message_preview": self._message_preview(message),
+            "progress_status": initial_progress,
         }
+        self._start_progress_tracking(route, task_key, message.reply_target, message, started_at)
         try:
             downloaded_paths = await self._download_attachments(message.attachments, downloads_dir)
-            prompt, image_paths = self._build_prompt(message, downloaded_paths)
+            include_bridge_preamble = self.backend != "app_server"
+            prompt, image_paths = self._build_prompt(
+                message,
+                downloaded_paths,
+                include_bridge_preamble=include_bridge_preamble,
+            )
+            developer_instructions = self._build_thread_instructions() if self.backend == "app_server" else None
             existing_session = self.sessions.get(route, scope_key)
             result = await self.runner.run(
                 prompt=prompt,
@@ -902,7 +1127,8 @@ class MultiRouteCodexFeishuService:
                 session_id=existing_session,
                 image_paths=image_paths,
                 run_key=task_key,
-                on_progress=None,
+                on_progress=lambda text: self._update_progress_status(task_key, text),
+                developer_instructions=developer_instructions,
             )
             if result.session_id:
                 self.sessions.set(route, scope_key, result.session_id)
@@ -923,20 +1149,230 @@ class MultiRouteCodexFeishuService:
             )
             if result.interrupted:
                 title = "这轮已中断"
+                template = "orange"
             else:
-                title = "搞定，来交作业" if result.success else "这轮卡住了"
+                title = "已完成" if result.success else "这轮卡住了"
+                template = "green" if result.success else "red"
+
+            extra_text_needed = False
             if clean_text.strip():
-                await self.bot.send_card(message.reply_target, title, clean_text)
+                progress_content = clean_text
+                if len(progress_content) > 20000:
+                    extra_text_needed = True
+                    progress_content = "最终结果较长，我会在下面继续分段补发完整文本。"
             elif artifacts:
-                await self.bot.send_text(message.reply_target, "文字结果不多，但我把这轮产出的文件给你带回来了。")
+                progress_content = "文字结果不多，但我把这轮产出的文件给你带回来了。"
             else:
-                await self.bot.send_text(message.reply_target, "这轮已经跑完，不过暂时没有可直接展示的文字结果。")
+                progress_content = "这轮已经跑完，不过暂时没有可直接展示的文字结果。"
+
+            progress_handled = await self._finish_progress_tracking(
+                task_key=task_key,
+                title=title,
+                content=progress_content,
+                template=template,
+            )
+
+            if extra_text_needed:
+                await self.bot.send_card(message.reply_target, title, clean_text)
+            elif not progress_handled:
+                if clean_text.strip():
+                    await self._send_final_text(message.reply_target, title, clean_text)
+                elif artifacts:
+                    await self.bot.send_text(message.reply_target, "文字结果不多，但我把这轮产出的文件给你带回来了。")
+                else:
+                    await self.bot.send_text(message.reply_target, "这轮已经跑完，不过暂时没有可直接展示的文字结果。")
             await self._send_artifacts(message.reply_target, artifacts)
         except Exception as exc:
             logger.exception("Task error")
-            await self.bot.send_card(message.reply_target, "这轮卡住了", f"```\n{exc}\n```")
+            error_text = f"```\n{exc}\n```"
+            progress_handled = await self._finish_progress_tracking(
+                task_key=task_key,
+                title="这轮卡住了",
+                content=error_text,
+                template="red",
+            )
+            if not progress_handled:
+                await self.bot.send_card(message.reply_target, "这轮卡住了", error_text)
         finally:
+            await self._discard_progress_tracking(task_key)
             self._running_meta.pop(task_key, None)
+
+    def _start_progress_tracking(
+        self,
+        route: RouteConfig,
+        task_key: str,
+        reply_target: str,
+        message: FeishuInboundMessage,
+        started_at: float,
+    ) -> None:
+        if not route.show_progress:
+            return
+        state = ProgressCardState(
+            task_key=task_key,
+            reply_target=reply_target,
+            route_name=route.name,
+            workdir=route.workdir,
+            message_preview=self._message_preview(message),
+            started_at=started_at,
+            show_delay_seconds=route.progress_delay_seconds,
+            force_show_seconds=max(route.progress_delay_seconds, route.progress_force_show_seconds),
+            keepalive_seconds=route.progress_keepalive_seconds,
+        )
+        self._progress_cards[task_key] = state
+        state.show_task = asyncio.create_task(self._show_progress_card_later(task_key))
+
+    async def _show_progress_card_later(self, task_key: str) -> None:
+        state = self._progress_cards.get(task_key)
+        if state is None:
+            return
+        try:
+            while True:
+                elapsed = max(0.0, time.time() - state.started_at)
+                if state.has_meaningful_activity and elapsed >= state.show_delay_seconds:
+                    break
+                if elapsed >= state.force_show_seconds:
+                    break
+                next_deadline = state.force_show_seconds
+                if state.has_meaningful_activity:
+                    next_deadline = min(next_deadline, state.show_delay_seconds)
+                wait_seconds = max(0.2, next_deadline - elapsed)
+                await asyncio.sleep(wait_seconds)
+                state = self._progress_cards.get(task_key)
+                if state is None or state.done:
+                    return
+        except asyncio.CancelledError:
+            return
+        state = self._progress_cards.get(task_key)
+        if state is None or state.done:
+            return
+        shown = await self._render_progress_card(task_key, force=True)
+        state = self._progress_cards.get(task_key)
+        if shown and state is not None and state.keepalive_task is None:
+            state.keepalive_task = asyncio.create_task(self._keep_progress_card_alive(task_key))
+
+    async def _keep_progress_card_alive(self, task_key: str) -> None:
+        while True:
+            state = self._progress_cards.get(task_key)
+            if state is None or state.done:
+                return
+            try:
+                await asyncio.sleep(state.keepalive_seconds)
+            except asyncio.CancelledError:
+                return
+            state = self._progress_cards.get(task_key)
+            if state is None or state.done:
+                return
+            await self._render_progress_card(task_key, force=True)
+
+    async def _update_progress_status(self, task_key: str, status: str, *, force: bool = False) -> None:
+        clean_status = status.strip() or "处理中…"
+        running_meta = self._running_meta.get(task_key)
+        if running_meta is not None:
+            running_meta["progress_status"] = clean_status
+        state = self._progress_cards.get(task_key)
+        if state is None or state.done:
+            return
+        state.status = clean_status
+        if self._progress_status_indicates_meaningful_activity(clean_status):
+            state.has_meaningful_activity = True
+        elapsed = max(0.0, time.time() - state.started_at)
+        if not state.visible and state.has_meaningful_activity and elapsed >= state.show_delay_seconds:
+            shown = await self._render_progress_card(task_key, force=True)
+            if shown and state.keepalive_task is None:
+                state.keepalive_task = asyncio.create_task(self._keep_progress_card_alive(task_key))
+            return
+        if state.visible:
+            await self._render_progress_card(task_key, force=force)
+
+    @staticmethod
+    def _progress_status_indicates_meaningful_activity(status: str) -> bool:
+        return status.startswith("刚执行命令：") or status.startswith("中途冒了个提示：") or status.startswith("已发送中断信号")
+
+    async def _render_progress_card(self, task_key: str, *, force: bool = False) -> bool:
+        state = self._progress_cards.get(task_key)
+        if state is None or state.done:
+            return False
+        async with state.render_lock:
+            if state.done:
+                return False
+            title = "Codex 正在处理"
+            content = self._build_progress_card_content(state)
+            render_key = f"{title}\n{content}"
+            now = time.time()
+            if not force and render_key == state.last_render_key:
+                return state.visible
+            if state.visible and not force and now - state.last_render_at < PROGRESS_UPDATE_MIN_INTERVAL_SECONDS:
+                return True
+            if state.message_id:
+                ok = await self.bot.update_card_message(state.message_id, title, content, "blue")
+                if ok:
+                    state.visible = True
+                    state.last_render_key = render_key
+                    state.last_render_at = now
+                    return True
+                return False
+            message_id = await self.bot.send_card_message(state.reply_target, title, content, "blue")
+            if not message_id:
+                return False
+            state.message_id = message_id
+            state.visible = True
+            state.last_render_key = render_key
+            state.last_render_at = now
+            return True
+
+    async def _finish_progress_tracking(self, *, task_key: str, title: str, content: str, template: str) -> bool:
+        state = self._progress_cards.get(task_key)
+        if state is None:
+            return False
+        async with state.render_lock:
+            state.done = True
+            self._cancel_progress_state_tasks(state)
+            if not state.message_id:
+                return False
+            return await self.bot.update_card_message(state.message_id, title, content, template)
+
+    async def _discard_progress_tracking(self, task_key: str) -> None:
+        state = self._progress_cards.pop(task_key, None)
+        if state is None:
+            return
+        state.done = True
+        self._cancel_progress_state_tasks(state)
+
+    @staticmethod
+    def _cancel_progress_state_tasks(state: ProgressCardState) -> None:
+        current_task = asyncio.current_task()
+        for task in (state.show_task, state.keepalive_task):
+            if task is not None and task is not current_task and not task.done():
+                task.cancel()
+        state.show_task = None
+        state.keepalive_task = None
+
+    @staticmethod
+    def _build_progress_card_content(state: ProgressCardState) -> str:
+        elapsed = max(1, int(time.time() - state.started_at))
+        return "\n".join(
+            [
+                f"**项目:** {state.route_name}",
+                f"**路径:** `{state.workdir}`",
+                f"**状态:** {state.status}",
+                f"**已耗时:** {elapsed} 秒",
+                f"**任务:** {state.message_preview}",
+            ]
+        )
+
+    @staticmethod
+    def _build_thread_instructions() -> str:
+        return "\n\n".join(
+            [
+                "你正在通过飞书与用户协作，当前工作目录已经由外层固定。",
+                "请默认使用中文回答。",
+                "只有当你生成的是适合直接回传飞书查看的结果文件时，才在回复末尾单独使用以下格式列出：",
+                "MEDIA:相对路径",
+                "FILE:相对路径",
+                "这类结果通常指图片、PDF、表格、演示文稿、压缩包等面向查看或交付的产物。",
+                "不要把源码文件、脚本、配置文件、依赖清单、测试文件或普通项目文件修改列为回传文件；这些只需要在正文里说明即可，除非用户明确要求把该文件发到飞书。",
+            ]
+        )
 
     async def _download_attachments(self, attachments: list[FeishuAttachment], downloads_dir: Path) -> list[Path]:
         downloaded: list[Path] = []
@@ -945,7 +1381,13 @@ class MultiRouteCodexFeishuService:
             downloaded.append(path_obj)
         return downloaded
 
-    def _build_prompt(self, message: FeishuInboundMessage, downloaded_paths: list[Path]) -> tuple[str, list[str]]:
+    def _build_prompt(
+        self,
+        message: FeishuInboundMessage,
+        downloaded_paths: list[Path],
+        *,
+        include_bridge_preamble: bool = True,
+    ) -> tuple[str, list[str]]:
         image_paths = [str(path_obj) for path_obj in downloaded_paths if path_obj.suffix.lower() in IMAGE_SUFFIXES]
         file_paths = [str(path_obj) for path_obj in downloaded_paths if path_obj.suffix.lower() not in IMAGE_SUFFIXES]
         user_text = message.text.strip()
@@ -959,14 +1401,20 @@ class MultiRouteCodexFeishuService:
             else:
                 user_text = "请处理我刚发送的内容。"
 
-        parts = [
-            "你正在通过飞书与用户协作，当前工作目录已经由外层固定。",
-            "请默认使用中文回答。",
-            "如果你在当前项目里生成了需要回传飞书的结果文件，请在回复末尾单独使用以下格式列出：",
-            "MEDIA:相对路径",
-            "FILE:相对路径",
-            "如果有多份文件，可以写多行；相对路径以当前工作目录为基准。",
-        ]
+        parts: list[str] = []
+        if include_bridge_preamble:
+            parts.extend(
+                [
+                    "你正在通过飞书与用户协作，当前工作目录已经由外层固定。",
+                    "请默认使用中文回答。",
+                    "只有当你生成的是适合直接回传飞书查看的结果文件时，才在回复末尾单独使用以下格式列出：",
+                    "MEDIA:相对路径",
+                    "FILE:相对路径",
+                    "这类结果通常指图片、PDF、表格、演示文稿、压缩包等面向查看或交付的产物。",
+                    "不要把源码文件、脚本、配置文件、依赖清单、测试文件或普通项目文件修改列为回传文件；这些只需要在正文里说明即可，除非用户明确要求把该文件发到飞书。",
+                    "如果有多份文件，可以写多行；相对路径以当前工作目录为基准。",
+                ]
+            )
         if image_paths:
             parts.append("本轮收到的图片附件：\n- " + "\n- ".join(image_paths))
         if file_paths:
@@ -998,6 +1446,9 @@ class MultiRouteCodexFeishuService:
             value = match.group(2).strip().strip('"\'')
             resolved = self._resolve_path_within_workdir(value, workdir)
             if resolved and resolved.exists() and resolved.is_file():
+                if not self._is_sendable_artifact_path(resolved):
+                    logger.info("Skipping non-sendable artifact path {}", resolved)
+                    continue
                 actual_kind = "image" if resolved.suffix.lower() in IMAGE_SUFFIXES else "file"
                 if kind == "media":
                     kind = actual_kind
@@ -1007,6 +1458,13 @@ class MultiRouteCodexFeishuService:
         cleaned = "\n".join(line for line in kept_lines).strip()
         return artifacts, cleaned
 
+    @staticmethod
+    def _is_sendable_artifact_path(path_obj: Path) -> bool:
+        suffix = path_obj.suffix.lower()
+        if suffix in IMAGE_SUFFIXES:
+            return True
+        return suffix not in BLOCKED_ARTIFACT_SUFFIXES
+
     def _find_recent_artifacts(self, workdir: str, started_at: float, max_items: int) -> list[Artifact]:
         candidates: list[Artifact] = []
         root = Path(workdir)
@@ -1015,6 +1473,8 @@ class MultiRouteCodexFeishuService:
             for file_name in file_names:
                 path_obj = Path(current_root) / file_name
                 if path_obj.suffix.lower() not in RECENT_ARTIFACT_SUFFIXES:
+                    continue
+                if not self._is_sendable_artifact_path(path_obj):
                     continue
                 try:
                     stat = path_obj.stat()
@@ -1045,6 +1505,29 @@ class MultiRouteCodexFeishuService:
                 await self.bot.send_image(reply_target, str(artifact.path))
             else:
                 await self.bot.send_file(reply_target, str(artifact.path), artifact.path.name)
+
+    async def _send_final_text(self, reply_target: str, title: str, text: str) -> None:
+        if self._should_send_final_as_card(text):
+            await self.bot.send_card(reply_target, title, text)
+            return
+        await self.bot.send_text(reply_target, text)
+
+    @staticmethod
+    def _should_send_final_as_card(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if len(stripped) > 280:
+            return True
+        if "```" in stripped:
+            return True
+        if re.search(r"^#{1,6}\s", stripped, flags=re.MULTILINE):
+            return True
+        if re.search(r"^\|.+\|$", stripped, flags=re.MULTILINE):
+            return True
+        if re.search(r"^\s*[-*]\s+.+", stripped, flags=re.MULTILINE) and "\n" in stripped:
+            return True
+        return False
 
     @staticmethod
     def _resolve_path_within_workdir(raw_path: str, workdir: str) -> Path | None:
@@ -1153,11 +1636,14 @@ class MultiRouteCodexFeishuService:
                 "这个服务会把当前飞书群固定映射到指定项目路径。一个群就是一个项目、一条连续上下文。",
                 f"- 当前项目：`{route.name}`",
                 f"- 当前路径：`{route.workdir}`",
+                f"- 后端模式：`{self.backend}`",
+                f"- 长任务进度卡：{'开启' if route.show_progress else '关闭'}",
                 "",
                 "**命令**",
                 "- 直接发文本：继续这个群当前的项目上下文",
                 "- 发图片或文件：会先进入一个短暂拼包窗口，方便你再补文字说明",
                 "- 同一个群里连续发多条消息：会自动排队，依次执行",
+                "- 长任务默认会在群里保留一张运行卡片，持续显示当前状态和耗时",
                 "- `/status`：查看当前路由、排队情况和待补充输入状态",
                 "- `/usage`：查看当前上下文与当前项目累计 token 用量",
                 "- `/lastcmd`：查看上一条成功执行的 shell 命令",
@@ -1165,11 +1651,12 @@ class MultiRouteCodexFeishuService:
                 "- `/clearqueue`：清空当前群里排队但未开始的消息",
                 "- `/send`：立即提交当前待补充的图文输入",
                 "- `/dropinput`：丢弃当前待补充的图文输入",
+                "- `/release`：释放当前项目的常驻 Codex app-server 进程（不清空上下文）",
                 "- `/new` 或 `/reset`：在同一路径下开启新上下文",
                 "- `/help`：查看帮助",
                 "",
                 "**结果回传**",
-                "- 如果 Codex 生成图片/文件，可以在回复末尾输出 `MEDIA:` 或 `FILE:` 路径，服务会自动回传。",
+                "- 如果 Codex 生成图片或交付类结果文件，可以在回复末尾输出 `MEDIA:` 或 `FILE:` 路径，服务会自动回传；源码、脚本、配置文件默认不会作为附件发回飞书。",
             ]
         )
 
@@ -1178,20 +1665,35 @@ class MultiRouteCodexFeishuService:
         session = self.sessions.describe(route, scope_key)
         pending_count = len(self._pending_messages.get(task_key) or ())
         running_meta = self._running_meta.get(task_key) or {}
+        runtime_status = self.runner.route_status(route.name) or {}
         draft_summary, draft_preview = self._describe_input_bundle(input_bundle_key)
         updated_at = session.get("updated_at") if isinstance(session, dict) else None
         updated_line = self._format_time(updated_at)
+        idle_timeout_seconds = int(runtime_status.get("idle_timeout_seconds") or 0)
+        idle_for_seconds = int(runtime_status.get("idle_for_seconds") or 0)
+        idle_remaining = max(0, idle_timeout_seconds - idle_for_seconds) if idle_timeout_seconds > 0 else 0
+        runtime_running = bool(runtime_status.get("running"))
         return "\n".join(
             [
                 f"**项目:** {route.name}",
                 f"**路径:** `{route.workdir}`",
+                f"**后端模式:** `{self.backend}`",
                 f"**任务状态:** {'运行中' if active else '空闲'}",
+                f"**当前进度:** {running_meta.get('progress_status') or '无'}",
+                f"**常驻进程:** {'运行中' if runtime_running else '未启动'}",
+                f"**活跃 turn 数:** {int(runtime_status.get('active_turns') or 0)}",
+                f"**空闲自动释放:** {str(idle_timeout_seconds) + ' 秒' if idle_timeout_seconds > 0 else '关闭'}",
+                f"**距自动释放剩余:** {str(idle_remaining) + ' 秒' if runtime_running and idle_timeout_seconds > 0 and not active else '无'}",
+                f"**常驻进程最近活跃:** {self._format_time(runtime_status.get('last_used_at'))}",
                 f"**排队中消息数:** {pending_count}",
                 f"**待补充输入:** {draft_summary}",
                 f"**待补充内容:** {draft_preview}",
                 f"**当前运行开始于:** {self._format_time(running_meta.get('started_at'))}",
                 f"**当前运行内容:** {running_meta.get('message_preview') or '无'}",
                 f"**当前上下文:** {'已建立' if session else '未建立'}",
+                "",
+                f"**终端接续用线程 ID:** `{session.get('session_id') if isinstance(session, dict) and session.get('session_id') else '无'}`",
+                "",
                 f"**上次更新时间:** {updated_line}",
                 f"**当前项目已保存上下文数:** {self.sessions.count(route)}",
             ]
@@ -1265,12 +1767,19 @@ def main() -> None:
         default="codex",
         help="Fallback path to the Codex CLI binary",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["exec", "app_server"],
+        default="app_server",
+        help="Codex backend mode: one-shot exec or persistent app-server",
+    )
     args = parser.parse_args()
 
     service = MultiRouteCodexFeishuService(
         routes_path=args.routes,
         session_store_path=args.session_store,
         codex_bin=args.codex_bin,
+        backend=args.backend,
         state_dir=args.state_dir,
         legacy_session_store=args.legacy_session_store,
     )
@@ -1278,6 +1787,9 @@ def main() -> None:
         asyncio.run(service.start())
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+    finally:
+        with contextlib.suppress(Exception):
+            asyncio.run(service.shutdown())
 
 
 if __name__ == "__main__":

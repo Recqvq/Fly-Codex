@@ -9,7 +9,8 @@
 - 图片与文件输入：支持飞书图片、文件下载后交给 Codex 处理
 - 输入拼包：图片/文件可在短时间内等待文字说明再合并执行
 - 任务控制：支持 `/status`、`/usage`、`/lastcmd`、`/interrupt`、`/clearqueue`、`/send`、`/dropinput`
-- 结果回传：支持图片、文档等结果文件自动回传到飞书
+- 结果回传：支持图片、文档等结果文件自动回传到飞书，源码/脚本/配置文件默认不会作为附件回传
+- 长任务进度卡：任务超过短阈值时，群里只保留一张运行卡，持续更新状态与耗时
 
 ## 依赖
 
@@ -51,7 +52,12 @@ cp routes.example.json routes.json
     "codex_bin": "codex",
     "codex_args": [],
     "auto_send_recent_artifacts": true,
-    "max_auto_artifacts": 3
+    "max_auto_artifacts": 3,
+    "show_progress": true,
+    "progress_delay_seconds": 8,
+    "progress_force_show_seconds": 15,
+    "progress_keepalive_seconds": 3,
+    "app_server_idle_timeout_seconds": 900
   },
   "routes": [
     {
@@ -64,10 +70,32 @@ cp routes.example.json routes.json
 }
 ```
 
+后端相关配置：
+
+- `--backend app_server`：默认模式，使用常驻 `codex app-server` 进程，减少重复启动开销
+- `app_server` 模式会把静态桥接说明放在线程级，只把当前这轮用户请求和附件信息作为 turn 输入，减少每轮重复包装
+- `--backend exec`：沿用当前的一次一启 `codex exec` 模式
+
+进度卡相关配置：
+
+- `show_progress`：是否开启长任务运行卡
+- `progress_delay_seconds`：任务超过多少秒后才显示运行卡，建议设置得比普通问答明显更长
+- `progress_force_show_seconds`：即使没有明显执行迹象，超过多久也显示运行卡
+- `progress_keepalive_seconds`：长任务运行中，多久刷新一次耗时显示
+- `app_server_idle_timeout_seconds`：常驻 `app_server` 空闲多久后自动释放，`0` 表示不自动释放
+
 ## 启动
+
+默认使用常驻进程模式 `app_server`：
 
 ```bash
 uv run python codex-feishu-server.py
+```
+
+如果想切回一次一启的 `exec` 后端：
+
+```bash
+uv run python codex-feishu-server.py --backend exec
 ```
 
 ## 常用命令
@@ -80,6 +108,8 @@ uv run python codex-feishu-server.py
 - `/clearqueue`：清空当前群里排队但未开始的消息
 - `/send`：立即提交当前待补充的图文输入
 - `/dropinput`：丢弃当前待补充的图文输入
+- `/release`：手动释放当前项目的常驻 `app_server` 进程，不清空上下文
+- `/status` 会额外显示当前 route 的常驻进程状态、最近活跃时间和自动释放倒计时
 - `/new` / `/reset`：重开当前群的 Codex 上下文
 
 ## 使用方式
@@ -88,6 +118,7 @@ uv run python codex-feishu-server.py
 - 图片或文件：先进入短暂拼包窗口，等待你补文字说明后再合并执行
 - 同群多条消息：自动排队顺序执行
 - 不同群：可并行处理不同项目
+- 长任务：默认任务明显变慢后才显示运行卡，并在同一张卡片上持续刷新状态与已耗时
 
 ## 会话存储
 

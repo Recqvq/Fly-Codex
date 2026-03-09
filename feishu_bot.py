@@ -20,6 +20,8 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
     GetMessageResourceRequest,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
 )
 from loguru import logger
 
@@ -244,7 +246,7 @@ class FeishuBot:
                     return parsed
         return ""
 
-    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
+    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | bool:
         try:
             request = (
                 CreateMessageRequest.builder()
@@ -262,10 +264,49 @@ class FeishuBot:
             if not response.success():
                 logger.error("Send failed: code={}, msg={}", response.code, response.msg)
                 return False
-            return True
+            return (
+                response.data.message_id
+                if response.data is not None and isinstance(response.data.message_id, str)
+                else True
+            )
         except Exception as exc:
             logger.error("Error sending message: {}", exc)
             return False
+
+    def _update_message_sync(self, message_id: str, content: str) -> bool:
+        if self._client is None:
+            raise RuntimeError("Feishu client is not initialized")
+        try:
+            request = (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(content)
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.im.v1.message.patch(request)
+            if not response.success():
+                logger.error("Patch failed: code={}, msg={}", response.code, response.msg)
+                return False
+            return True
+        except Exception as exc:
+            logger.error("Error patching message: {}", exc)
+            return False
+
+    @staticmethod
+    def _card_payload(title: str, content: str, template: str | None = None) -> str:
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": template or ("green" if "completed" in title.lower() or "done" in title.lower() else "blue"),
+            },
+            "elements": [{"tag": "markdown", "content": content}],
+        }
+        return json.dumps(card, ensure_ascii=False)
 
     async def send_text(self, chat_id: str, text: str) -> None:
         receive_id_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
@@ -273,30 +314,37 @@ class FeishuBot:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._send_message_sync, receive_id_type, chat_id, "text", content)
 
-    async def send_card(self, chat_id: str, title: str, content: str) -> None:
+    async def send_card_message(self, chat_id: str, title: str, content: str, template: str | None = None) -> str | None:
         receive_id_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
         loop = asyncio.get_running_loop()
+        payload = self._card_payload(title, content, template)
+        result = await loop.run_in_executor(
+            None,
+            self._send_message_sync,
+            receive_id_type,
+            chat_id,
+            "interactive",
+            payload,
+        )
+        return result if isinstance(result, str) and result.strip() else None
+
+    async def update_card_message(
+        self,
+        message_id: str,
+        title: str,
+        content: str,
+        template: str | None = None,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        payload = self._card_payload(title, content, template)
+        return bool(await loop.run_in_executor(None, self._update_message_sync, message_id, payload))
+
+    async def send_card(self, chat_id: str, title: str, content: str) -> None:
         chunks = self._split_content(content, MAX_CARD_CONTENT_LEN)
         total = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             card_title = title if total == 1 else f"{title} ({index}/{total})"
-            card = {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {"tag": "plain_text", "content": card_title},
-                    "template": "green" if "completed" in title.lower() or "done" in title.lower() else "blue",
-                },
-                "elements": [{"tag": "markdown", "content": chunk}],
-            }
-            content_json = json.dumps(card, ensure_ascii=False)
-            await loop.run_in_executor(
-                None,
-                self._send_message_sync,
-                receive_id_type,
-                chat_id,
-                "interactive",
-                content_json,
-            )
+            await self.send_card_message(chat_id, card_title, chunk)
 
     async def download_attachment(self, attachment: FeishuAttachment, target_dir: str) -> Path:
         if self._client is None:

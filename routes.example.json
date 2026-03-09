@@ -3,7 +3,12 @@
     "codex_bin": "codex",
     "codex_args": [],
     "auto_send_recent_artifacts": true,
-    "max_auto_artifacts": 3
+    "max_auto_artifacts": 3,
+    "show_progress": true,
+    "progress_delay_seconds": 8,
+    "progress_force_show_seconds": 15,
+    "progress_keepalive_seconds": 3,
+    "app_server_idle_timeout_seconds": 900
   },
   "routes": [
     {
