@@ -1,0 +1,1284 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import tempfile
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+
+from config import APP_ID, APP_SECRET
+from feishu_bot import FeishuAttachment, FeishuBot, FeishuInboundMessage, IMAGE_SUFFIXES
+
+DEFAULT_ROUTES_FILE = "routes.json"
+DEFAULT_SESSION_STORE = ".fly-codex-sessions.json"
+DEFAULT_CACHE_DIR = ".fly-codex"
+RECENT_ARTIFACT_SUFFIXES = IMAGE_SUFFIXES | {
+    ".pdf",
+    ".csv",
+    ".tsv",
+    ".xlsx",
+    ".xls",
+    ".docx",
+    ".doc",
+    ".pptx",
+    ".ppt",
+    ".zip",
+    ".txt",
+    ".md",
+    ".json",
+}
+IGNORE_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}
+ARTIFACT_LINE_RE = re.compile(r"^(MEDIA|FILE):\s*(.+?)\s*$", re.IGNORECASE)
+COMMAND_OUTPUT_PREVIEW = 1200
+MESSAGE_PREVIEW_LIMIT = 160
+INPUT_BUNDLE_IDLE_SECONDS = 8.0
+INPUT_BUNDLE_MAX_WAIT_SECONDS = 20.0
+
+
+@dataclass(slots=True)
+class RouteConfig:
+    name: str
+    chat_id: str
+    workdir: str
+    allowed_senders: list[str] = field(default_factory=list)
+    codex_bin: str | None = None
+    codex_args: list[str] = field(default_factory=list)
+    auto_send_recent_artifacts: bool = True
+    max_auto_artifacts: int = 3
+
+
+@dataclass(slots=True)
+class Artifact:
+    kind: str
+    path: Path
+
+
+@dataclass(slots=True)
+class CodexRunResult:
+    output: str
+    session_id: str | None
+    success: bool
+    interrupted: bool = False
+    event_lines: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class InputBundle:
+    bundle_key: str
+    route_name: str
+    reply_target: str
+    chat_id: str
+    chat_type: str
+    sender_id: str
+    sender_name: str | None
+    root_id: str | None
+    parent_id: str | None
+    thread_id: str | None
+    message_id: str
+    message_type: str
+    texts: list[str] = field(default_factory=list)
+    attachments: list[FeishuAttachment] = field(default_factory=list)
+    first_at: float = 0.0
+    last_at: float = 0.0
+    due_at: float = 0.0
+    generation: int = 0
+    flush_task: asyncio.Task[Any] | None = None
+
+
+class RouteTable:
+    def __init__(self, config_path: str):
+        self.config_path = Path(config_path).expanduser().resolve()
+        self.defaults: dict[str, Any] = {}
+        self.routes_by_chat: dict[str, RouteConfig] = {}
+        self.routes_by_name: dict[str, RouteConfig] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.config_path.exists():
+            raise FileNotFoundError(
+                f"Route config not found: {self.config_path}. Please create it from routes.example.json."
+            )
+        raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("routes.json must be a JSON object")
+        defaults = raw.get("defaults") or {}
+        if not isinstance(defaults, dict):
+            raise ValueError("defaults must be an object")
+        self.defaults = defaults
+        routes = raw.get("routes") or []
+        if not isinstance(routes, list):
+            raise ValueError("routes must be a JSON array")
+        self.routes_by_chat.clear()
+        self.routes_by_name.clear()
+        for entry in routes:
+            if not isinstance(entry, dict):
+                raise ValueError("each route must be an object")
+            name = str(entry.get("name", "")).strip()
+            chat_id = str(entry.get("chat_id", "")).strip()
+            workdir = str(entry.get("workdir", "")).strip()
+            if not name or not chat_id or not workdir:
+                raise ValueError(f"route requires name/chat_id/workdir: {entry}")
+            route = RouteConfig(
+                name=name,
+                chat_id=chat_id,
+                workdir=os.path.abspath(os.path.expanduser(workdir)),
+                allowed_senders=[
+                    str(item).strip()
+                    for item in (entry.get("allowed_senders") or defaults.get("allowed_senders") or [])
+                    if str(item).strip()
+                ],
+                codex_bin=str(entry.get("codex_bin") or defaults.get("codex_bin") or "codex").strip() or "codex",
+                codex_args=[
+                    str(item).strip()
+                    for item in (entry.get("codex_args") or defaults.get("codex_args") or [])
+                    if str(item).strip()
+                ],
+                auto_send_recent_artifacts=bool(
+                    entry.get(
+                        "auto_send_recent_artifacts",
+                        defaults.get("auto_send_recent_artifacts", True),
+                    )
+                ),
+                max_auto_artifacts=max(
+                    0,
+                    int(entry.get("max_auto_artifacts") or defaults.get("max_auto_artifacts") or 3),
+                ),
+            )
+            if not os.path.isdir(route.workdir):
+                raise ValueError(f"route {route.name} workdir does not exist: {route.workdir}")
+            if route.chat_id in self.routes_by_chat:
+                raise ValueError(f"duplicate chat_id in routes: {route.chat_id}")
+            self.routes_by_chat[route.chat_id] = route
+            self.routes_by_name[route.name] = route
+
+    def resolve(self, chat_id: str) -> RouteConfig | None:
+        return self.routes_by_chat.get(chat_id)
+
+    def summary_lines(self) -> list[str]:
+        lines = []
+        for route in self.routes_by_name.values():
+            lines.append(f"- {route.name}: {route.chat_id} -> {route.workdir}")
+        return lines
+
+
+class SessionStore:
+    def __init__(self, store_path: str, routes: RouteTable, legacy_path: str | None = None):
+        self.store_path = Path(store_path).expanduser().resolve()
+        self.routes = routes
+        self.legacy_path = Path(legacy_path).expanduser().resolve() if legacy_path else None
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        self._data = self._load()
+        self._migrate_legacy_if_needed()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.store_path.exists():
+            return {"version": 3, "sessions": {}, "scope_metrics": {}, "route_metrics": {}}
+        try:
+            data = json.loads(self.store_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("version", 3)
+                data.setdefault("sessions", {})
+                data.setdefault("scope_metrics", {})
+                data.setdefault("route_metrics", {})
+                return data
+        except Exception as exc:
+            logger.warning("Failed to load session store {}: {}", self.store_path, exc)
+        return {"version": 3, "sessions": {}, "scope_metrics": {}, "route_metrics": {}}
+
+    def _save(self) -> None:
+        temp_path = self.store_path.with_suffix(f"{self.store_path.suffix}.tmp")
+        temp_path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, self.store_path)
+
+    def _migrate_legacy_if_needed(self) -> None:
+        if not self.legacy_path or not self.legacy_path.exists():
+            return
+        sessions = self._data.setdefault("sessions", {})
+        if sessions:
+            return
+        try:
+            legacy = json.loads(self.legacy_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to read legacy session store {}: {}", self.legacy_path, exc)
+            return
+        workspaces = legacy.get("workspaces") if isinstance(legacy, dict) else None
+        if not isinstance(workspaces, dict):
+            return
+        migrated = 0
+        for route in self.routes.routes_by_name.values():
+            legacy_sessions = workspaces.get(route.workdir)
+            if not isinstance(legacy_sessions, dict):
+                continue
+            for chat_id, entry in legacy_sessions.items():
+                if not isinstance(entry, dict):
+                    continue
+                session_id = str(entry.get("thread_id", "")).strip()
+                if not session_id:
+                    continue
+                key = self._session_storage_key(route.name, f"chat:{chat_id}")
+                sessions[key] = {
+                    "route_name": route.name,
+                    "chat_id": chat_id,
+                    "scope_key": f"chat:{chat_id}",
+                    "session_id": session_id,
+                    "updated_at": int(entry.get("updated_at") or time.time()),
+                    "workdir": route.workdir,
+                }
+                migrated += 1
+        if migrated:
+            logger.info("Migrated {} legacy Codex session(s) from {}", migrated, self.legacy_path)
+            self._save()
+
+    @staticmethod
+    def _session_storage_key(route_name: str, scope_key: str) -> str:
+        return f"{route_name}::{scope_key}"
+
+    def get(self, route: RouteConfig, scope_key: str) -> str | None:
+        entry = self._data.setdefault("sessions", {}).get(self._session_storage_key(route.name, scope_key))
+        if isinstance(entry, dict):
+            session_id = entry.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                return session_id.strip()
+        return None
+
+    def set(self, route: RouteConfig, scope_key: str, session_id: str) -> None:
+        self._data.setdefault("sessions", {})[self._session_storage_key(route.name, scope_key)] = {
+            "route_name": route.name,
+            "chat_id": route.chat_id,
+            "scope_key": scope_key,
+            "session_id": session_id,
+            "updated_at": int(time.time()),
+            "workdir": route.workdir,
+        }
+        self._save()
+
+    def clear(self, route: RouteConfig, scope_key: str) -> bool:
+        storage_key = self._session_storage_key(route.name, scope_key)
+        removed = self._data.setdefault("sessions", {}).pop(storage_key, None)
+        removed_metrics = self._data.setdefault("scope_metrics", {}).pop(storage_key, None)
+        if removed is not None or removed_metrics is not None:
+            self._save()
+            return True
+        return False
+
+    def describe(self, route: RouteConfig, scope_key: str) -> dict[str, Any] | None:
+        entry = self._data.setdefault("sessions", {}).get(self._session_storage_key(route.name, scope_key))
+        return entry if isinstance(entry, dict) else None
+
+    def count(self, route: RouteConfig | None = None) -> int:
+        sessions = self._data.setdefault("sessions", {})
+        if route is None:
+            return len(sessions)
+        prefix = f"{route.name}::"
+        return sum(1 for key in sessions if key.startswith(prefix))
+
+    @staticmethod
+    def _empty_usage() -> dict[str, int]:
+        return {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+    @staticmethod
+    def _preview_text(text: str, limit: int = MESSAGE_PREVIEW_LIMIT) -> str:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        if not compact:
+            return "(空消息或仅附件)"
+        return compact[:limit] + ("…" if len(compact) > limit else "")
+
+    def _ensure_scope_metrics(self, route: RouteConfig, scope_key: str) -> dict[str, Any]:
+        storage_key = self._session_storage_key(route.name, scope_key)
+        scope_metrics = self._data.setdefault("scope_metrics", {})
+        entry = scope_metrics.get(storage_key)
+        if not isinstance(entry, dict):
+            entry = {
+                "route_name": route.name,
+                "chat_id": route.chat_id,
+                "scope_key": scope_key,
+                "workdir": route.workdir,
+                "task_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "usage_totals": self._empty_usage(),
+            }
+            scope_metrics[storage_key] = entry
+        return entry
+
+    def _ensure_route_metrics(self, route: RouteConfig) -> dict[str, Any]:
+        route_metrics = self._data.setdefault("route_metrics", {})
+        entry = route_metrics.get(route.name)
+        if not isinstance(entry, dict):
+            entry = {
+                "route_name": route.name,
+                "chat_id": route.chat_id,
+                "workdir": route.workdir,
+                "task_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "usage_totals": self._empty_usage(),
+            }
+            route_metrics[route.name] = entry
+        return entry
+
+    @staticmethod
+    def _normalize_usage(usage: dict[str, Any] | None) -> dict[str, int] | None:
+        if not isinstance(usage, dict):
+            return None
+        return {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        }
+
+    def record_run(
+        self,
+        route: RouteConfig,
+        scope_key: str,
+        *,
+        message_text: str,
+        success: bool,
+        usage: dict[str, Any] | None,
+        last_successful_command: dict[str, Any] | None,
+    ) -> None:
+        now = int(time.time())
+        normalized_usage = self._normalize_usage(usage)
+        metrics_targets = [
+            self._ensure_scope_metrics(route, scope_key),
+            self._ensure_route_metrics(route),
+        ]
+        preview = self._preview_text(message_text)
+        for metrics in metrics_targets:
+            metrics["task_count"] = int(metrics.get("task_count") or 0) + 1
+            if success:
+                metrics["success_count"] = int(metrics.get("success_count") or 0) + 1
+            else:
+                metrics["failure_count"] = int(metrics.get("failure_count") or 0) + 1
+            metrics["updated_at"] = now
+            metrics["last_message_preview"] = preview
+            if normalized_usage:
+                totals = metrics.setdefault("usage_totals", self._empty_usage())
+                for key, value in normalized_usage.items():
+                    totals[key] = int(totals.get(key) or 0) + value
+                metrics["last_usage"] = {**normalized_usage, "updated_at": now}
+            if isinstance(last_successful_command, dict):
+                metrics["last_successful_command"] = {
+                    "command": str(last_successful_command.get("command") or "").strip(),
+                    "output": str(last_successful_command.get("output") or "")[:COMMAND_OUTPUT_PREVIEW],
+                    "exit_code": int(last_successful_command.get("exit_code") or 0),
+                    "updated_at": now,
+                }
+        self._save()
+
+    def describe_scope_metrics(self, route: RouteConfig, scope_key: str) -> dict[str, Any] | None:
+        entry = self._data.setdefault("scope_metrics", {}).get(self._session_storage_key(route.name, scope_key))
+        return entry if isinstance(entry, dict) else None
+
+    def describe_route_metrics(self, route: RouteConfig) -> dict[str, Any] | None:
+        entry = self._data.setdefault("route_metrics", {}).get(route.name)
+        return entry if isinstance(entry, dict) else None
+
+
+class CodexRunner:
+    def __init__(self, default_bin: str = "codex"):
+        self.default_bin = default_bin
+        self._active_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._interrupted_runs: set[str] = set()
+
+    async def run(
+        self,
+        *,
+        prompt: str,
+        route: RouteConfig,
+        session_id: str | None,
+        image_paths: list[str],
+        run_key: str | None = None,
+        on_progress: callable | None = None,
+    ) -> CodexRunResult:
+        output_path = None
+        env = os.environ.copy()
+        env.setdefault("NO_COLOR", "1")
+        events: list[dict[str, Any]] = []
+        resolved_session_id = session_id
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                prefix="fly-codex-last-message-",
+                suffix=".txt",
+            ) as temp_file:
+                output_path = temp_file.name
+            cmd = self._build_cmd(prompt=prompt, output_path=output_path, route=route, session_id=session_id, image_paths=image_paths)
+            logger.info("Running Codex route={} mode={} workdir={}", route.name, "resume" if session_id else "new", route.workdir)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=route.workdir,
+                env=env,
+            )
+            if run_key:
+                self._active_processes[run_key] = proc
+
+            async def read_stdout() -> None:
+                nonlocal resolved_session_id
+                assert proc.stdout is not None
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    line_text = line.decode("utf-8", errors="replace").strip()
+                    if not line_text:
+                        continue
+                    try:
+                        event = json.loads(line_text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    events.append(event)
+                    event_type = str(event.get("type", "")).strip()
+                    if event_type == "thread.started":
+                        thread_id = str(event.get("thread_id", "")).strip()
+                        if thread_id:
+                            resolved_session_id = thread_id
+                            if on_progress:
+                                await on_progress("上下文接好了，我开始动手。")
+                    elif event_type == "turn.started" and on_progress:
+                        await on_progress("我正在项目里翻代码、跑命令。")
+                    elif event_type == "error":
+                        message = str(event.get("message", "")).strip()
+                        if on_progress and message and not message.startswith("Reconnecting..."):
+                            await on_progress(f"中途冒了个提示：{message}")
+
+            async def read_stderr() -> str:
+                assert proc.stderr is not None
+                content = await proc.stderr.read()
+                return content.decode("utf-8", errors="replace").strip()
+
+            stderr_task = asyncio.create_task(read_stderr())
+            stdout_task = asyncio.create_task(read_stdout())
+            await asyncio.gather(stdout_task)
+            return_code = await proc.wait()
+            stderr_text = await stderr_task
+            interrupted = bool(run_key and run_key in self._interrupted_runs)
+
+            result_text = ""
+            if output_path and os.path.exists(output_path):
+                result_text = Path(output_path).read_text(encoding="utf-8", errors="replace").strip()
+            if not result_text:
+                result_text = self._extract_last_agent_message(events)
+
+            if interrupted or return_code in {-15, -9}:
+                return CodexRunResult(
+                    output=result_text or "任务已中断。",
+                    session_id=resolved_session_id,
+                    success=False,
+                    interrupted=True,
+                    event_lines=events,
+                )
+
+            if return_code != 0:
+                parts = [f"命令退出码：{return_code}"]
+                if result_text:
+                    parts.append(result_text)
+                if stderr_text:
+                    parts.append(stderr_text)
+                return CodexRunResult(
+                    output="\n\n".join(part for part in parts if part).strip() or "Codex 执行失败。",
+                    session_id=resolved_session_id,
+                    success=False,
+                    interrupted=False,
+                    event_lines=events,
+                )
+
+            if not result_text:
+                result_text = "Codex 没有返回可显示的最终文本。"
+            return CodexRunResult(
+                output=result_text,
+                session_id=resolved_session_id,
+                success=True,
+                interrupted=False,
+                event_lines=events,
+            )
+        finally:
+            if run_key:
+                self._active_processes.pop(run_key, None)
+                self._interrupted_runs.discard(run_key)
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+
+    async def interrupt(self, run_key: str) -> bool:
+        proc = self._active_processes.get(run_key)
+        if proc is None or proc.returncode is not None:
+            return False
+        self._interrupted_runs.add(run_key)
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return False
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        return True
+
+    def _build_cmd(
+        self,
+        *,
+        prompt: str,
+        output_path: str,
+        route: RouteConfig,
+        session_id: str | None,
+        image_paths: list[str],
+    ) -> list[str]:
+        common_args = [
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--json",
+            "-o",
+            output_path,
+        ]
+        if route.codex_args:
+            common_args.extend(route.codex_args)
+        for image_path in image_paths:
+            common_args.extend(["-i", image_path])
+        codex_bin = route.codex_bin or self.default_bin
+        if session_id:
+            return [codex_bin, "exec", "resume", *common_args, session_id, prompt]
+        return [codex_bin, "exec", *common_args, prompt]
+
+    @staticmethod
+    def _extract_last_agent_message(events: list[dict[str, Any]]) -> str:
+        last_message = ""
+        for event in events:
+            if event.get("type") != "item.completed":
+                continue
+            item = event.get("item")
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    last_message = text.strip()
+        return last_message
+
+
+class MultiRouteCodexFeishuService:
+    def __init__(
+        self,
+        *,
+        routes_path: str,
+        session_store_path: str,
+        codex_bin: str,
+        state_dir: str,
+        legacy_session_store: str | None,
+    ):
+        self.routes = RouteTable(routes_path)
+        self.bot = FeishuBot(APP_ID, APP_SECRET)
+        self.sessions = SessionStore(session_store_path, self.routes, legacy_session_store)
+        self.runner = CodexRunner(default_bin=codex_bin)
+        self.state_dir = Path(state_dir).expanduser().resolve()
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._active_tasks: dict[str, bool] = {}
+        self._pending_messages: dict[str, deque[FeishuInboundMessage]] = {}
+        self._running_meta: dict[str, dict[str, Any]] = {}
+        self._input_bundles: dict[str, InputBundle] = {}
+        self._dispatch_lock = asyncio.Lock()
+        self._bundle_lock = asyncio.Lock()
+        self.bot.on_message(self._handle_message)
+
+    async def start(self) -> None:
+        logger.info("Starting FlyingCodex with {} route(s)", len(self.routes.routes_by_name))
+        for line in self.routes.summary_lines():
+            logger.info(line)
+        await self.bot.start()
+
+    async def _handle_message(self, message: FeishuInboundMessage) -> None:
+        route = self.routes.resolve(message.chat_id)
+        if route is None:
+            logger.info("Ignoring message from unmapped chat {}", message.chat_id)
+            return
+        if route.allowed_senders and message.sender_id not in route.allowed_senders:
+            logger.info("Ignoring message from unauthorized sender {} in route {}", message.sender_id, route.name)
+            return
+
+        scope_key = self._build_scope_key(route, message)
+        task_key = f"{route.name}::{scope_key}"
+        input_bundle_key = self._build_input_bundle_key(message)
+        raw_text = message.text.strip()
+        command = raw_text.split(None, 1)[0].lower() if raw_text else ""
+        if command == "/help":
+            await self.bot.send_card(message.reply_target, "使用说明", self._build_help_text(route))
+            return
+        if command in {"/status", "status"}:
+            await self.bot.send_card(
+                message.reply_target,
+                "群状态",
+                self._build_status_text(route, scope_key, task_key, input_bundle_key),
+            )
+            return
+        if command == "/usage":
+            await self.bot.send_card(message.reply_target, "上下文用量", self._build_usage_text(route, scope_key))
+            return
+        if command == "/lastcmd":
+            await self.bot.send_card(message.reply_target, "上一条成功命令", self._build_last_command_text(route, scope_key))
+            return
+        if command in {"/interrupt", "/stop", "/cancel"}:
+            stopped = await self.runner.interrupt(task_key)
+            if stopped:
+                pending_count = len(self._pending_messages.get(task_key) or ())
+                text = "当前正在跑的任务已发送中断信号。"
+                if pending_count:
+                    text += f" 后面还排着 {pending_count} 条，会继续顺序执行。"
+                await self.bot.send_text(message.reply_target, text)
+            else:
+                await self.bot.send_text(message.reply_target, "当前没有可中断的运行中任务。")
+            return
+        if command == "/clearqueue":
+            cleared = await self._clear_pending_queue(task_key)
+            if cleared:
+                await self.bot.send_text(message.reply_target, f"已清空排队中的 {cleared} 条消息；当前正在跑的这条不受影响。")
+            else:
+                await self.bot.send_text(message.reply_target, "当前没有排队中的消息。")
+            return
+        if command == "/send":
+            bundled_message = await self._submit_input_bundle(input_bundle_key)
+            if bundled_message is None:
+                await self.bot.send_text(message.reply_target, "当前没有待提交的图文输入。")
+                return
+            await self.bot.send_text(message.reply_target, "已提交当前待补充输入，开始进入任务队列。")
+            await self._enqueue_task_message(route, bundled_message)
+            return
+        if command == "/dropinput":
+            dropped_bundle = await self._drop_input_bundle(input_bundle_key)
+            if dropped_bundle is None:
+                await self.bot.send_text(message.reply_target, "当前没有待补充的图文输入。")
+                return
+            await self.bot.send_text(
+                message.reply_target,
+                f"已丢弃待补充输入（{len(dropped_bundle.texts)} 段文字，{len(dropped_bundle.attachments)} 个附件）。",
+            )
+            return
+        if command in {"/new", "/reset"}:
+            if self._active_tasks.get(task_key):
+                await self.bot.send_text(message.reply_target, "这个群里上一条任务还在跑，等它收工后我再帮你重开上下文。")
+                return
+            await self._drop_input_bundle(input_bundle_key)
+            removed = self.sessions.clear(route, scope_key)
+            text = "这个群绑定的 Codex 上下文已经清空；你下一条消息会直接在同一路径下新开一轮。"
+            if not removed:
+                text = "这个群目前还没有历史上下文；你下一条消息会直接新开一轮。"
+            await self.bot.send_card(message.reply_target, "上下文已重开", text)
+            return
+
+        if message.attachments:
+            await self._stage_input_bundle(route, message, input_bundle_key)
+            return
+
+        if raw_text:
+            bundled_message = await self._submit_input_bundle(input_bundle_key, extra_message=message)
+            if bundled_message is not None:
+                await self._enqueue_task_message(route, bundled_message)
+                return
+
+        await self._enqueue_task_message(route, message)
+
+    async def _enqueue_task_message(self, route: RouteConfig, message: FeishuInboundMessage) -> None:
+        scope_key = self._build_scope_key(route, message)
+        task_key = f"{route.name}::{scope_key}"
+        should_start = False
+        ahead_count = 0
+        async with self._dispatch_lock:
+            queue = self._pending_messages.setdefault(task_key, deque())
+            queue.append(message)
+            if self._active_tasks.get(task_key):
+                ahead_count = len(queue)
+            else:
+                self._active_tasks[task_key] = True
+                should_start = True
+
+        if not should_start:
+            await self.bot.send_text(
+                message.reply_target,
+                f"收到，先排队。前面还有 {ahead_count} 条，这条跑完我会自动继续。",
+            )
+            return
+
+        await self._drain_task_queue(route, scope_key, task_key)
+
+    async def _stage_input_bundle(self, route: RouteConfig, message: FeishuInboundMessage, bundle_key: str) -> None:
+        now = time.time()
+        async with self._bundle_lock:
+            bundle = self._input_bundles.get(bundle_key)
+            if bundle is None:
+                bundle = InputBundle(
+                    bundle_key=bundle_key,
+                    route_name=route.name,
+                    reply_target=message.reply_target,
+                    chat_id=message.chat_id,
+                    chat_type=message.chat_type,
+                    sender_id=message.sender_id,
+                    sender_name=message.sender_name,
+                    root_id=message.root_id,
+                    parent_id=message.parent_id,
+                    thread_id=message.thread_id,
+                    message_id=message.message_id,
+                    message_type=message.message_type,
+                    first_at=now,
+                )
+                self._input_bundles[bundle_key] = bundle
+            self._append_to_input_bundle(bundle, message, now)
+            self._reschedule_input_bundle_locked(bundle, now)
+
+    async def _submit_input_bundle(
+        self,
+        bundle_key: str,
+        *,
+        extra_message: FeishuInboundMessage | None = None,
+    ) -> FeishuInboundMessage | None:
+        async with self._bundle_lock:
+            bundle = self._input_bundles.get(bundle_key)
+            if bundle is None:
+                return None
+            now = time.time()
+            if extra_message is not None:
+                self._append_to_input_bundle(bundle, extra_message, now)
+            self._input_bundles.pop(bundle_key, None)
+            self._cancel_input_bundle_task(bundle)
+            bundle.flush_task = None
+            return self._bundle_to_message(bundle)
+
+    async def _drop_input_bundle(self, bundle_key: str) -> InputBundle | None:
+        async with self._bundle_lock:
+            bundle = self._input_bundles.pop(bundle_key, None)
+            if bundle is None:
+                return None
+            self._cancel_input_bundle_task(bundle)
+            bundle.flush_task = None
+            return bundle
+
+    async def _auto_flush_input_bundle(self, bundle_key: str, generation: int, due_at: float) -> None:
+        wait_seconds = max(0.0, due_at - time.time())
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            return
+
+        async with self._bundle_lock:
+            bundle = self._input_bundles.get(bundle_key)
+            if bundle is None or bundle.generation != generation:
+                return
+            self._input_bundles.pop(bundle_key, None)
+            bundle.flush_task = None
+            bundled_message = self._bundle_to_message(bundle)
+            route = self.routes.routes_by_name.get(bundle.route_name)
+
+        if route is None:
+            logger.warning("Ignoring auto-submitted input bundle for unknown route {}", bundle.route_name)
+            return
+        await self._enqueue_task_message(route, bundled_message)
+
+    async def _clear_pending_queue(self, task_key: str) -> int:
+        async with self._dispatch_lock:
+            queue = self._pending_messages.get(task_key)
+            if not queue:
+                return 0
+            cleared = len(queue)
+            queue.clear()
+            self._pending_messages.pop(task_key, None)
+            return cleared
+
+    def _cancel_input_bundle_task(self, bundle: InputBundle) -> None:
+        current_task = asyncio.current_task()
+        flush_task = bundle.flush_task
+        if flush_task is not None and flush_task is not current_task and not flush_task.done():
+            flush_task.cancel()
+        bundle.flush_task = None
+
+    def _reschedule_input_bundle_locked(self, bundle: InputBundle, now: float) -> None:
+        self._cancel_input_bundle_task(bundle)
+        bundle.generation += 1
+        max_due_at = bundle.first_at + INPUT_BUNDLE_MAX_WAIT_SECONDS
+        bundle.due_at = min(now + INPUT_BUNDLE_IDLE_SECONDS, max_due_at)
+        bundle.flush_task = asyncio.create_task(
+            self._auto_flush_input_bundle(bundle.bundle_key, bundle.generation, bundle.due_at)
+        )
+
+    @staticmethod
+    def _append_to_input_bundle(bundle: InputBundle, message: FeishuInboundMessage, now: float) -> None:
+        text = message.text.strip()
+        if text:
+            bundle.texts.append(text)
+        if message.attachments:
+            bundle.attachments.extend(message.attachments)
+        if bundle.first_at <= 0:
+            bundle.first_at = now
+        bundle.last_at = now
+        bundle.reply_target = message.reply_target
+        bundle.chat_id = message.chat_id
+        bundle.chat_type = message.chat_type
+        bundle.sender_id = message.sender_id
+        bundle.sender_name = message.sender_name
+        bundle.root_id = message.root_id
+        bundle.parent_id = message.parent_id
+        bundle.thread_id = message.thread_id
+        bundle.message_id = message.message_id
+        bundle.message_type = message.message_type
+
+    @staticmethod
+    def _bundle_to_message(bundle: InputBundle) -> FeishuInboundMessage:
+        text = "\n\n".join(part for part in bundle.texts if part.strip()).strip()
+        return FeishuInboundMessage(
+            sender_id=bundle.sender_id,
+            sender_name=bundle.sender_name,
+            reply_target=bundle.reply_target,
+            chat_id=bundle.chat_id,
+            chat_type=bundle.chat_type,
+            message_id=bundle.message_id,
+            message_type=bundle.message_type,
+            text=text,
+            root_id=bundle.root_id,
+            parent_id=bundle.parent_id,
+            thread_id=bundle.thread_id,
+            attachments=list(bundle.attachments),
+        )
+
+    async def _drain_task_queue(self, route: RouteConfig, scope_key: str, task_key: str) -> None:
+        try:
+            while True:
+                async with self._dispatch_lock:
+                    queue = self._pending_messages.get(task_key)
+                    if not queue:
+                        self._pending_messages.pop(task_key, None)
+                        self._active_tasks[task_key] = False
+                        return
+                    message = queue.popleft()
+                    if not queue:
+                        self._pending_messages.pop(task_key, None)
+                await self._run_single_message(route, scope_key, task_key, message)
+        finally:
+            async with self._dispatch_lock:
+                if not self._pending_messages.get(task_key):
+                    self._pending_messages.pop(task_key, None)
+                    self._active_tasks[task_key] = False
+
+    async def _run_single_message(
+        self,
+        route: RouteConfig,
+        scope_key: str,
+        task_key: str,
+        message: FeishuInboundMessage,
+    ) -> None:
+        started_at = time.time()
+        downloads_dir = self.state_dir / "downloads" / route.name / self._scope_dir_name(scope_key)
+        self._running_meta[task_key] = {
+            "started_at": int(started_at),
+            "message_preview": self._message_preview(message),
+        }
+        try:
+            downloaded_paths = await self._download_attachments(message.attachments, downloads_dir)
+            prompt, image_paths = self._build_prompt(message, downloaded_paths)
+            existing_session = self.sessions.get(route, scope_key)
+            result = await self.runner.run(
+                prompt=prompt,
+                route=route,
+                session_id=existing_session,
+                image_paths=image_paths,
+                run_key=task_key,
+                on_progress=None,
+            )
+            if result.session_id:
+                self.sessions.set(route, scope_key, result.session_id)
+            usage = self._extract_turn_usage(result.event_lines)
+            last_successful_command = self._extract_last_successful_command(result.event_lines)
+            self.sessions.record_run(
+                route,
+                scope_key,
+                message_text=self._message_preview(message),
+                success=result.success,
+                usage=usage,
+                last_successful_command=last_successful_command,
+            )
+            clean_text, artifacts = self._resolve_artifacts(
+                route=route,
+                output_text=result.output,
+                started_at=started_at,
+            )
+            if result.interrupted:
+                title = "这轮已中断"
+            else:
+                title = "搞定，来交作业" if result.success else "这轮卡住了"
+            if clean_text.strip():
+                await self.bot.send_card(message.reply_target, title, clean_text)
+            elif artifacts:
+                await self.bot.send_text(message.reply_target, "文字结果不多，但我把这轮产出的文件给你带回来了。")
+            else:
+                await self.bot.send_text(message.reply_target, "这轮已经跑完，不过暂时没有可直接展示的文字结果。")
+            await self._send_artifacts(message.reply_target, artifacts)
+        except Exception as exc:
+            logger.exception("Task error")
+            await self.bot.send_card(message.reply_target, "这轮卡住了", f"```\n{exc}\n```")
+        finally:
+            self._running_meta.pop(task_key, None)
+
+    async def _download_attachments(self, attachments: list[FeishuAttachment], downloads_dir: Path) -> list[Path]:
+        downloaded: list[Path] = []
+        for attachment in attachments:
+            path_obj = await self.bot.download_attachment(attachment, str(downloads_dir))
+            downloaded.append(path_obj)
+        return downloaded
+
+    def _build_prompt(self, message: FeishuInboundMessage, downloaded_paths: list[Path]) -> tuple[str, list[str]]:
+        image_paths = [str(path_obj) for path_obj in downloaded_paths if path_obj.suffix.lower() in IMAGE_SUFFIXES]
+        file_paths = [str(path_obj) for path_obj in downloaded_paths if path_obj.suffix.lower() not in IMAGE_SUFFIXES]
+        user_text = message.text.strip()
+        if not user_text:
+            if image_paths and file_paths:
+                user_text = "请同时分析我刚发送的图片和文件，并给出结论。"
+            elif image_paths:
+                user_text = "请分析我刚发送的图片，并给出结论。"
+            elif file_paths:
+                user_text = "请分析我刚发送的文件，并给出结论。"
+            else:
+                user_text = "请处理我刚发送的内容。"
+
+        parts = [
+            "你正在通过飞书与用户协作，当前工作目录已经由外层固定。",
+            "请默认使用中文回答。",
+            "如果你在当前项目里生成了需要回传飞书的结果文件，请在回复末尾单独使用以下格式列出：",
+            "MEDIA:相对路径",
+            "FILE:相对路径",
+            "如果有多份文件，可以写多行；相对路径以当前工作目录为基准。",
+        ]
+        if image_paths:
+            parts.append("本轮收到的图片附件：\n- " + "\n- ".join(image_paths))
+        if file_paths:
+            parts.append(
+                "本轮收到的文件附件（你可以直接读取这些本地文件）：\n- " + "\n- ".join(file_paths)
+            )
+        parts.append("用户请求：\n" + user_text)
+        return "\n\n".join(parts), image_paths
+
+    def _resolve_artifacts(self, *, route: RouteConfig, output_text: str, started_at: float) -> tuple[str, list[Artifact]]:
+        explicit, clean_text = self._extract_explicit_artifacts(output_text, route.workdir)
+        if explicit:
+            return clean_text, explicit
+        if route.auto_send_recent_artifacts:
+            inferred = self._find_recent_artifacts(route.workdir, started_at, route.max_auto_artifacts)
+            if inferred:
+                return clean_text, inferred
+        return clean_text, []
+
+    def _extract_explicit_artifacts(self, output_text: str, workdir: str) -> tuple[list[Artifact], str]:
+        artifacts: list[Artifact] = []
+        kept_lines: list[str] = []
+        for raw_line in output_text.splitlines():
+            match = ARTIFACT_LINE_RE.match(raw_line.strip())
+            if not match:
+                kept_lines.append(raw_line)
+                continue
+            kind = match.group(1).lower()
+            value = match.group(2).strip().strip('"\'')
+            resolved = self._resolve_path_within_workdir(value, workdir)
+            if resolved and resolved.exists() and resolved.is_file():
+                actual_kind = "image" if resolved.suffix.lower() in IMAGE_SUFFIXES else "file"
+                if kind == "media":
+                    kind = actual_kind
+                artifacts.append(Artifact(kind=kind if kind in {"image", "file"} else actual_kind, path=resolved))
+                continue
+            kept_lines.append(raw_line)
+        cleaned = "\n".join(line for line in kept_lines).strip()
+        return artifacts, cleaned
+
+    def _find_recent_artifacts(self, workdir: str, started_at: float, max_items: int) -> list[Artifact]:
+        candidates: list[Artifact] = []
+        root = Path(workdir)
+        for current_root, dir_names, file_names in os.walk(root):
+            dir_names[:] = [name for name in dir_names if name not in IGNORE_DIRS and not name.startswith(".")]
+            for file_name in file_names:
+                path_obj = Path(current_root) / file_name
+                if path_obj.suffix.lower() not in RECENT_ARTIFACT_SUFFIXES:
+                    continue
+                try:
+                    stat = path_obj.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < started_at - 1:
+                    continue
+                if stat.st_size > 30 * 1024 * 1024:
+                    continue
+                kind = "image" if path_obj.suffix.lower() in IMAGE_SUFFIXES else "file"
+                candidates.append(Artifact(kind=kind, path=path_obj))
+        candidates.sort(key=lambda item: item.path.stat().st_mtime, reverse=True)
+        deduped: list[Artifact] = []
+        seen: set[str] = set()
+        for item in candidates:
+            key = str(item.path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= max_items:
+                break
+        return deduped
+
+    async def _send_artifacts(self, reply_target: str, artifacts: list[Artifact]) -> None:
+        for artifact in artifacts:
+            if artifact.kind == "image":
+                await self.bot.send_image(reply_target, str(artifact.path))
+            else:
+                await self.bot.send_file(reply_target, str(artifact.path), artifact.path.name)
+
+    @staticmethod
+    def _resolve_path_within_workdir(raw_path: str, workdir: str) -> Path | None:
+        value = raw_path.strip()
+        if not value:
+            return None
+        workdir_path = Path(workdir).resolve()
+        candidate = Path(value)
+        resolved = candidate.resolve() if candidate.is_absolute() else (workdir_path / candidate).resolve()
+        try:
+            resolved.relative_to(workdir_path)
+        except ValueError:
+            return None
+        return resolved
+
+    @staticmethod
+    def _scope_dir_name(scope_key: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9._-]+", "_", scope_key).strip("_") or "default"
+
+    @staticmethod
+    def _build_scope_key(route: RouteConfig, message: FeishuInboundMessage) -> str:
+        return f"chat:{message.chat_id}"
+
+    @staticmethod
+    def _format_usage(usage: dict[str, Any] | None) -> str:
+        if not isinstance(usage, dict):
+            return "无"
+        return (
+            f"输入 {int(usage.get('input_tokens') or 0)}"
+            f" / 缓存 {int(usage.get('cached_input_tokens') or 0)}"
+            f" / 输出 {int(usage.get('output_tokens') or 0)}"
+        )
+
+    @staticmethod
+    def _format_time(timestamp: Any) -> str:
+        if not timestamp:
+            return "无"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(timestamp)))
+
+    @staticmethod
+    def _extract_turn_usage(events: list[dict[str, Any]]) -> dict[str, int] | None:
+        for event in reversed(events):
+            if event.get("type") != "turn.completed":
+                continue
+            usage = event.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            return {
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+            }
+        return None
+
+    @staticmethod
+    def _extract_last_successful_command(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for event in reversed(events):
+            if event.get("type") != "item.completed":
+                continue
+            item = event.get("item")
+            if not isinstance(item, dict) or item.get("type") != "command_execution":
+                continue
+            command = str(item.get("command") or "").strip()
+            if not command:
+                continue
+            exit_code = item.get("exit_code")
+            if int(exit_code or -1) != 0:
+                continue
+            output = str(item.get("aggregated_output") or "")
+            return {
+                "command": command,
+                "output": output[:COMMAND_OUTPUT_PREVIEW],
+                "exit_code": 0,
+            }
+        return None
+
+    @staticmethod
+    def _message_preview(message: FeishuInboundMessage) -> str:
+        if message.text.strip():
+            return SessionStore._preview_text(message.text)
+        if message.attachments:
+            return f"(仅附件，共 {len(message.attachments)} 个)"
+        return "(空消息)"
+
+    @staticmethod
+    def _build_input_bundle_key(message: FeishuInboundMessage) -> str:
+        topic = message.root_id or message.thread_id or "main"
+        return f"chat:{message.chat_id}:sender:{message.sender_id}:topic:{topic}"
+
+    def _describe_input_bundle(self, bundle_key: str) -> tuple[str, str]:
+        bundle = self._input_bundles.get(bundle_key)
+        if bundle is None:
+            return "无", "无"
+        remaining_seconds = max(0, int(bundle.due_at - time.time() + 0.999))
+        summary = (
+            f"有（文字 {len(bundle.texts)} 段 / 附件 {len(bundle.attachments)} 个"
+            f" / 约 {remaining_seconds} 秒后自动提交）"
+        )
+        return summary, self._message_preview(self._bundle_to_message(bundle))
+
+    def _build_help_text(self, route: RouteConfig) -> str:
+        return "\n".join(
+            [
+                "**FlyingCodex**",
+                "",
+                "这个服务会把当前飞书群固定映射到指定项目路径。一个群就是一个项目、一条连续上下文。",
+                f"- 当前项目：`{route.name}`",
+                f"- 当前路径：`{route.workdir}`",
+                "",
+                "**命令**",
+                "- 直接发文本：继续这个群当前的项目上下文",
+                "- 发图片或文件：会先进入一个短暂拼包窗口，方便你再补文字说明",
+                "- 同一个群里连续发多条消息：会自动排队，依次执行",
+                "- `/status`：查看当前路由、排队情况和待补充输入状态",
+                "- `/usage`：查看当前上下文与当前项目累计 token 用量",
+                "- `/lastcmd`：查看上一条成功执行的 shell 命令",
+                "- `/interrupt`：中断当前正在运行的任务",
+                "- `/clearqueue`：清空当前群里排队但未开始的消息",
+                "- `/send`：立即提交当前待补充的图文输入",
+                "- `/dropinput`：丢弃当前待补充的图文输入",
+                "- `/new` 或 `/reset`：在同一路径下开启新上下文",
+                "- `/help`：查看帮助",
+                "",
+                "**结果回传**",
+                "- 如果 Codex 生成图片/文件，可以在回复末尾输出 `MEDIA:` 或 `FILE:` 路径，服务会自动回传。",
+            ]
+        )
+
+    def _build_status_text(self, route: RouteConfig, scope_key: str, task_key: str, input_bundle_key: str) -> str:
+        active = self._active_tasks.get(task_key, False)
+        session = self.sessions.describe(route, scope_key)
+        pending_count = len(self._pending_messages.get(task_key) or ())
+        running_meta = self._running_meta.get(task_key) or {}
+        draft_summary, draft_preview = self._describe_input_bundle(input_bundle_key)
+        updated_at = session.get("updated_at") if isinstance(session, dict) else None
+        updated_line = self._format_time(updated_at)
+        return "\n".join(
+            [
+                f"**项目:** {route.name}",
+                f"**路径:** `{route.workdir}`",
+                f"**任务状态:** {'运行中' if active else '空闲'}",
+                f"**排队中消息数:** {pending_count}",
+                f"**待补充输入:** {draft_summary}",
+                f"**待补充内容:** {draft_preview}",
+                f"**当前运行开始于:** {self._format_time(running_meta.get('started_at'))}",
+                f"**当前运行内容:** {running_meta.get('message_preview') or '无'}",
+                f"**当前上下文:** {'已建立' if session else '未建立'}",
+                f"**上次更新时间:** {updated_line}",
+                f"**当前项目已保存上下文数:** {self.sessions.count(route)}",
+            ]
+        )
+
+    def _build_usage_text(self, route: RouteConfig, scope_key: str) -> str:
+        scope_metrics = self.sessions.describe_scope_metrics(route, scope_key) or {}
+        route_metrics = self.sessions.describe_route_metrics(route) or {}
+        return "\n".join(
+            [
+                f"**项目:** {route.name}",
+                f"**路径:** `{route.workdir}`",
+                "",
+                "**当前上下文**",
+                f"- 任务数：{int(scope_metrics.get('task_count') or 0)}",
+                f"- 成功 / 失败：{int(scope_metrics.get('success_count') or 0)} / {int(scope_metrics.get('failure_count') or 0)}",
+                f"- 上一轮用量：{self._format_usage(scope_metrics.get('last_usage'))}",
+                f"- 累计用量：{self._format_usage(scope_metrics.get('usage_totals'))}",
+                f"- 最后更新：{self._format_time(scope_metrics.get('updated_at'))}",
+                "",
+                "**当前项目累计**",
+                f"- 任务数：{int(route_metrics.get('task_count') or 0)}",
+                f"- 成功 / 失败：{int(route_metrics.get('success_count') or 0)} / {int(route_metrics.get('failure_count') or 0)}",
+                f"- 上一轮用量：{self._format_usage(route_metrics.get('last_usage'))}",
+                f"- 累计用量：{self._format_usage(route_metrics.get('usage_totals'))}",
+                f"- 最后更新：{self._format_time(route_metrics.get('updated_at'))}",
+            ]
+        )
+
+    def _build_last_command_text(self, route: RouteConfig, scope_key: str) -> str:
+        scope_metrics = self.sessions.describe_scope_metrics(route, scope_key) or {}
+        route_metrics = self.sessions.describe_route_metrics(route) or {}
+        command_info = scope_metrics.get("last_successful_command") or route_metrics.get("last_successful_command")
+        if not isinstance(command_info, dict) or not str(command_info.get("command") or "").strip():
+            return "暂时还没有记录到成功执行过的 shell 命令。"
+        output = str(command_info.get("output") or "").strip()
+        parts = [
+            f"**时间:** {self._format_time(command_info.get('updated_at'))}",
+            f"**命令:**\n```bash\n{command_info.get('command')}\n```",
+            f"**退出码:** {int(command_info.get('exit_code') or 0)}",
+        ]
+        if output:
+            parts.append(f"**输出摘要:**\n```text\n{output}\n```")
+        return "\n".join(parts)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FlyingCodex: Feishu -> Codex multi-route bridge")
+    parser.add_argument(
+        "--routes",
+        default=str(Path(__file__).resolve().with_name(DEFAULT_ROUTES_FILE)),
+        help="JSON route config path (default: routes.json beside the script)",
+    )
+    parser.add_argument(
+        "--session-store",
+        default=str(Path(__file__).resolve().with_name(DEFAULT_SESSION_STORE)),
+        help="Session store path (default: .fly-codex-sessions.json beside the script)",
+    )
+    parser.add_argument(
+        "--legacy-session-store",
+        default=str(Path(__file__).resolve().with_name(".codex-feishu-sessions.json")),
+        help="Legacy single-project session store for migration",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=str(Path(__file__).resolve().with_name(DEFAULT_CACHE_DIR)),
+        help="Directory for downloaded attachments and runtime state",
+    )
+    parser.add_argument(
+        "--codex-bin",
+        default="codex",
+        help="Fallback path to the Codex CLI binary",
+    )
+    args = parser.parse_args()
+
+    service = MultiRouteCodexFeishuService(
+        routes_path=args.routes,
+        session_store_path=args.session_store,
+        codex_bin=args.codex_bin,
+        state_dir=args.state_dir,
+        legacy_session_store=args.legacy_session_store,
+    )
+    try:
+        asyncio.run(service.start())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+{
+  "defaults": {
+    "codex_bin": "codex",
+    "codex_args": [],
+    "auto_send_recent_artifacts": true,
+    "max_auto_artifacts": 3
+  },
+  "routes": [
+    {
+      "name": "demo-project",
+      "chat_id": "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "workdir": "/absolute/path/to/your/project",
+      "allowed_senders": []
+    }
+  ]
+}

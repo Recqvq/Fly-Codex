@@ -1,0 +1,11 @@
+config.py
+routes.json
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.codex-feishu-sessions.json
+.fly-codex-sessions.json
+.fly-codex/
+.fly-codex-test/
