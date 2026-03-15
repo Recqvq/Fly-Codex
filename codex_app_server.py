@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -55,6 +56,7 @@ class CodexAppServerRuntime:
         self._turns: dict[str, _PendingTurn] = {}
         self._run_key_to_turn_id: dict[str, str] = {}
         self._interrupted_run_keys: set[str] = set()
+        self._recent_stderr_lines: deque[str] = deque(maxlen=20)
         self.idle_timeout_seconds = float(getattr(route, "app_server_idle_timeout_seconds", 900.0) or 0.0)
         self.last_used_at = time.time()
         self._idle_task: asyncio.Task[Any] | None = None
@@ -260,7 +262,6 @@ class CodexAppServerRuntime:
                     "cwd": self.route.workdir,
                     "approvalPolicy": "never",
                     "sandbox": "danger-full-access",
-                    "persistExtendedHistory": True,
                     **({"developerInstructions": developer_instructions} if developer_instructions else {}),
                 },
                 timeout=30.0,
@@ -273,7 +274,6 @@ class CodexAppServerRuntime:
                     "approvalPolicy": "never",
                     "sandbox": "danger-full-access",
                     "serviceName": "flycodex",
-                    "persistExtendedHistory": True,
                     **({"developerInstructions": developer_instructions} if developer_instructions else {}),
                 },
                 timeout=30.0,
@@ -331,6 +331,12 @@ class CodexAppServerRuntime:
             await self.proc.stdin.drain()
         try:
             return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            stderr_tail = self._format_recent_stderr()
+            detail = f"Codex app-server request timed out after {timeout:.1f}s: {method}"
+            if stderr_tail:
+                detail += f"\nRecent stderr:\n{stderr_tail}"
+            raise RuntimeError(detail) from exc
         finally:
             self._pending_requests.pop(request_id, None)
 
@@ -377,6 +383,7 @@ class CodexAppServerRuntime:
                 return
             line_text = line.decode("utf-8", errors="replace").rstrip()
             if line_text:
+                self._recent_stderr_lines.append(line_text)
                 logger.debug("codex app-server[{}] {}", self.route.name, line_text)
 
     async def _wait_for_exit(self) -> None:
@@ -579,6 +586,11 @@ class CodexAppServerRuntime:
             return message
         return f"{message} (code={code})"
 
+    def _format_recent_stderr(self) -> str:
+        if not self._recent_stderr_lines:
+            return ""
+        return "\n".join(self._recent_stderr_lines)
+
 
 class CodexAppServerRunner:
     def __init__(self, default_bin: str = "codex"):
@@ -604,14 +616,20 @@ class CodexAppServerRunner:
         developer_instructions: str | None = None,
     ) -> AppServerRunResult:
         runtime = self._runtime_for_route(route)
-        return await runtime.run(
-            prompt=prompt,
-            session_id=session_id,
-            image_paths=image_paths,
-            run_key=run_key,
-            on_progress=on_progress,
-            developer_instructions=developer_instructions,
-        )
+        try:
+            return await runtime.run(
+                prompt=prompt,
+                session_id=session_id,
+                image_paths=image_paths,
+                run_key=run_key,
+                on_progress=on_progress,
+                developer_instructions=developer_instructions,
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                await runtime.close()
+            self._runtimes.pop(route.name, None)
+            raise
 
     async def interrupt(self, run_key: str) -> bool:
         for runtime in self._runtimes.values():

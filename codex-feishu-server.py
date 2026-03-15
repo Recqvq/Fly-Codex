@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -100,6 +101,8 @@ DEFAULT_PROGRESS_FORCE_SHOW_SECONDS = 15.0
 DEFAULT_PROGRESS_KEEPALIVE_SECONDS = 3.0
 DEFAULT_APP_SERVER_IDLE_TIMEOUT_SECONDS = 900.0
 PROGRESS_UPDATE_MIN_INTERVAL_SECONDS = 1.2
+SESSION_STORE_VERSION = 4
+DEFAULT_CONTEXT_NAME = "default"
 
 
 @dataclass(slots=True)
@@ -158,11 +161,19 @@ class InputBundle:
 
 
 @dataclass(slots=True)
+class QueuedTask:
+    message: FeishuInboundMessage
+    context_name: str
+    context_scope_key: str
+
+
+@dataclass(slots=True)
 class ProgressCardState:
     task_key: str
     reply_target: str
     route_name: str
     workdir: str
+    context_name: str
     message_preview: str
     started_at: float
     show_delay_seconds: float = DEFAULT_PROGRESS_DELAY_SECONDS
@@ -304,20 +315,38 @@ class SessionStore:
 
     def _load(self) -> dict[str, Any]:
         if not self.store_path.exists():
-            return {"version": 3, "sessions": {}, "scope_metrics": {}, "route_metrics": {}}
+            return {
+                "version": SESSION_STORE_VERSION,
+                "sessions": {},
+                "scope_metrics": {},
+                "route_metrics": {},
+                "chat_contexts": {},
+            }
         try:
             data = json.loads(self.store_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                data.setdefault("version", 3)
+                data.setdefault("version", SESSION_STORE_VERSION)
                 data.setdefault("sessions", {})
                 data.setdefault("scope_metrics", {})
                 data.setdefault("route_metrics", {})
+                data.setdefault("chat_contexts", {})
                 return data
         except Exception as exc:
             logger.warning("Failed to load session store {}: {}", self.store_path, exc)
-        return {"version": 3, "sessions": {}, "scope_metrics": {}, "route_metrics": {}}
+        return {
+            "version": SESSION_STORE_VERSION,
+            "sessions": {},
+            "scope_metrics": {},
+            "route_metrics": {},
+            "chat_contexts": {},
+        }
 
     def _save(self) -> None:
+        self._data["version"] = SESSION_STORE_VERSION
+        self._data.setdefault("sessions", {})
+        self._data.setdefault("scope_metrics", {})
+        self._data.setdefault("route_metrics", {})
+        self._data.setdefault("chat_contexts", {})
         temp_path = self.store_path.with_suffix(f"{self.store_path.suffix}.tmp")
         temp_path.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2, sort_keys=True),
@@ -368,6 +397,70 @@ class SessionStore:
     def _session_storage_key(route_name: str, scope_key: str) -> str:
         return f"{route_name}::{scope_key}"
 
+    @staticmethod
+    def _chat_context_storage_key(route_name: str, chat_scope_key: str) -> str:
+        return f"{route_name}::{chat_scope_key}"
+
+    @staticmethod
+    def _normalize_context_name(name: str) -> str:
+        compact = re.sub(r"\s+", " ", name or "").strip()
+        return compact[:80]
+
+    @staticmethod
+    def _context_scope_key(chat_scope_key: str, context_name: str) -> str:
+        normalized = SessionStore._normalize_context_name(context_name)
+        if not normalized or normalized.casefold() == DEFAULT_CONTEXT_NAME:
+            return chat_scope_key
+        slug_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", normalized).strip("-_.").lower()
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+        if slug_base:
+            slug_base = slug_base[:40].rstrip("-_.")
+            slug = f"{slug_base}-{digest}"
+        else:
+            slug = f"ctx-{digest}"
+        return f"{chat_scope_key}:ctx:{slug}"
+
+    @staticmethod
+    def _max_timestamp(*values: Any) -> int:
+        numbers = [int(value) for value in values if value]
+        return max(numbers) if numbers else 0
+
+    def _ensure_chat_context_entry(self, route: RouteConfig, chat_scope_key: str) -> dict[str, Any]:
+        storage_key = self._chat_context_storage_key(route.name, chat_scope_key)
+        chat_contexts = self._data.setdefault("chat_contexts", {})
+        entry = chat_contexts.get(storage_key)
+        if not isinstance(entry, dict):
+            entry = {
+                "route_name": route.name,
+                "chat_id": route.chat_id,
+                "chat_scope_key": chat_scope_key,
+                "active_context": DEFAULT_CONTEXT_NAME,
+                "contexts": {},
+                "updated_at": int(time.time()),
+                "workdir": route.workdir,
+            }
+            chat_contexts[storage_key] = entry
+        contexts = entry.get("contexts")
+        if not isinstance(contexts, dict):
+            contexts = {}
+            entry["contexts"] = contexts
+        if DEFAULT_CONTEXT_NAME not in contexts or not isinstance(contexts.get(DEFAULT_CONTEXT_NAME), dict):
+            contexts[DEFAULT_CONTEXT_NAME] = {
+                "name": DEFAULT_CONTEXT_NAME,
+                "scope_key": chat_scope_key,
+                "created_at": int(time.time()),
+                "updated_at": int(time.time()),
+            }
+        active_context = str(entry.get("active_context") or "").strip() or DEFAULT_CONTEXT_NAME
+        if active_context not in contexts:
+            active_context = DEFAULT_CONTEXT_NAME
+        entry["active_context"] = active_context
+        entry["route_name"] = route.name
+        entry["chat_id"] = route.chat_id
+        entry["chat_scope_key"] = chat_scope_key
+        entry["workdir"] = route.workdir
+        return entry
+
     def get(self, route: RouteConfig, scope_key: str) -> str | None:
         entry = self._data.setdefault("sessions", {}).get(self._session_storage_key(route.name, scope_key))
         if isinstance(entry, dict):
@@ -376,15 +469,55 @@ class SessionStore:
                 return session_id.strip()
         return None
 
-    def set(self, route: RouteConfig, scope_key: str, session_id: str) -> None:
+    def set(
+        self,
+        route: RouteConfig,
+        scope_key: str,
+        session_id: str,
+        *,
+        chat_scope_key: str | None = None,
+        context_name: str | None = None,
+    ) -> None:
+        now = int(time.time())
         self._data.setdefault("sessions", {})[self._session_storage_key(route.name, scope_key)] = {
             "route_name": route.name,
             "chat_id": route.chat_id,
             "scope_key": scope_key,
             "session_id": session_id,
-            "updated_at": int(time.time()),
+            "updated_at": now,
             "workdir": route.workdir,
         }
+        if chat_scope_key:
+            entry = self._ensure_chat_context_entry(route, chat_scope_key)
+            contexts = entry.setdefault("contexts", {})
+            target_name = None
+            normalized_name = self._normalize_context_name(context_name or "")
+            if normalized_name:
+                for existing_name in contexts:
+                    if existing_name.casefold() == normalized_name.casefold():
+                        target_name = existing_name
+                        break
+                if target_name is None:
+                    target_name = normalized_name
+                    contexts[target_name] = {
+                        "name": target_name,
+                        "scope_key": scope_key,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+            else:
+                for existing_name, metadata in contexts.items():
+                    if isinstance(metadata, dict) and str(metadata.get("scope_key") or "") == scope_key:
+                        target_name = existing_name
+                        break
+            if target_name is not None:
+                metadata = contexts.setdefault(target_name, {})
+                metadata["name"] = target_name
+                metadata["scope_key"] = scope_key
+                metadata["created_at"] = int(metadata.get("created_at") or now)
+                metadata["updated_at"] = now
+                entry["active_context"] = target_name
+                entry["updated_at"] = now
         self._save()
 
     def clear(self, route: RouteConfig, scope_key: str) -> bool:
@@ -399,6 +532,117 @@ class SessionStore:
     def describe(self, route: RouteConfig, scope_key: str) -> dict[str, Any] | None:
         entry = self._data.setdefault("sessions", {}).get(self._session_storage_key(route.name, scope_key))
         return entry if isinstance(entry, dict) else None
+
+    def resolve_context(self, route: RouteConfig, chat_scope_key: str) -> dict[str, Any]:
+        entry = self._ensure_chat_context_entry(route, chat_scope_key)
+        contexts = entry.get("contexts") if isinstance(entry.get("contexts"), dict) else {}
+        active_name = str(entry.get("active_context") or DEFAULT_CONTEXT_NAME)
+        context_meta = contexts.get(active_name) if isinstance(contexts, dict) else None
+        if not isinstance(context_meta, dict):
+            active_name = DEFAULT_CONTEXT_NAME
+            context_meta = contexts.get(active_name) if isinstance(contexts, dict) else None
+        scope_key = str((context_meta or {}).get("scope_key") or chat_scope_key)
+        session = self.describe(route, scope_key) or {}
+        metrics = self.describe_scope_metrics(route, scope_key) or {}
+        session_id = self.get(route, scope_key)
+        return {
+            "name": active_name,
+            "scope_key": scope_key,
+            "active": True,
+            "has_session": bool(session_id),
+            "session_id": session_id,
+            "updated_at": self._max_timestamp(
+                (context_meta or {}).get("updated_at"),
+                session.get("updated_at"),
+                metrics.get("updated_at"),
+            ),
+            "last_usage": metrics.get("last_usage") if isinstance(metrics, dict) else None,
+        }
+
+    def list_contexts(self, route: RouteConfig, chat_scope_key: str) -> list[dict[str, Any]]:
+        entry = self._ensure_chat_context_entry(route, chat_scope_key)
+        contexts = entry.get("contexts") if isinstance(entry.get("contexts"), dict) else {}
+        active_name = str(entry.get("active_context") or DEFAULT_CONTEXT_NAME)
+        result: list[dict[str, Any]] = []
+        if not isinstance(contexts, dict):
+            return result
+        for context_name, metadata in contexts.items():
+            if not isinstance(metadata, dict):
+                continue
+            scope_key = str(metadata.get("scope_key") or chat_scope_key)
+            session = self.describe(route, scope_key) or {}
+            metrics = self.describe_scope_metrics(route, scope_key) or {}
+            session_id = self.get(route, scope_key)
+            result.append(
+                {
+                    "name": context_name,
+                    "scope_key": scope_key,
+                    "active": context_name == active_name,
+                    "has_session": bool(session_id),
+                    "session_id": session_id,
+                    "updated_at": self._max_timestamp(
+                        metadata.get("updated_at"),
+                        session.get("updated_at"),
+                        metrics.get("updated_at"),
+                    ),
+                    "last_usage": metrics.get("last_usage") if isinstance(metrics, dict) else None,
+                }
+            )
+        result.sort(
+            key=lambda item: (
+                0 if item.get("active") else 1,
+                -int(item.get("updated_at") or 0),
+                str(item.get("name") or "").casefold(),
+            )
+        )
+        return result
+
+    def create_context(self, route: RouteConfig, chat_scope_key: str, context_name: str) -> tuple[dict[str, Any], bool]:
+        normalized_name = self._normalize_context_name(context_name)
+        if not normalized_name:
+            raise ValueError("上下文名称不能为空。")
+        entry = self._ensure_chat_context_entry(route, chat_scope_key)
+        contexts = entry.setdefault("contexts", {})
+        for existing_name in contexts:
+            if existing_name.casefold() == normalized_name.casefold():
+                entry["active_context"] = existing_name
+                entry["updated_at"] = int(time.time())
+                self._save()
+                return self.resolve_context(route, chat_scope_key), False
+        now = int(time.time())
+        contexts[normalized_name] = {
+            "name": normalized_name,
+            "scope_key": self._context_scope_key(chat_scope_key, normalized_name),
+            "created_at": now,
+            "updated_at": now,
+        }
+        entry["active_context"] = normalized_name
+        entry["updated_at"] = now
+        self._save()
+        return self.resolve_context(route, chat_scope_key), True
+
+    def activate_context(self, route: RouteConfig, chat_scope_key: str, context_name: str) -> dict[str, Any] | None:
+        normalized_name = self._normalize_context_name(context_name)
+        if not normalized_name:
+            return None
+        entry = self._ensure_chat_context_entry(route, chat_scope_key)
+        contexts = entry.get("contexts") if isinstance(entry.get("contexts"), dict) else {}
+        if not isinstance(contexts, dict):
+            return None
+        for existing_name in contexts:
+            if existing_name.casefold() != normalized_name.casefold():
+                continue
+            entry["active_context"] = existing_name
+            entry["updated_at"] = int(time.time())
+            self._save()
+            return self.resolve_context(route, chat_scope_key)
+        return None
+
+    def count_contexts(self, route: RouteConfig) -> int:
+        chat_scope_key = f"chat:{route.chat_id}"
+        entry = self._ensure_chat_context_entry(route, chat_scope_key)
+        contexts = entry.get("contexts") if isinstance(entry.get("contexts"), dict) else {}
+        return len(contexts) if isinstance(contexts, dict) else 0
 
     def count(self, route: RouteConfig | None = None) -> int:
         sessions = self._data.setdefault("sessions", {})
@@ -800,7 +1044,7 @@ class MultiRouteCodexFeishuService:
         self.state_dir = Path(state_dir).expanduser().resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._active_tasks: dict[str, bool] = {}
-        self._pending_messages: dict[str, deque[FeishuInboundMessage]] = {}
+        self._pending_messages: dict[str, deque[QueuedTask]] = {}
         self._running_meta: dict[str, dict[str, Any]] = {}
         self._progress_cards: dict[str, ProgressCardState] = {}
         self._input_bundles: dict[str, InputBundle] = {}
@@ -827,26 +1071,29 @@ class MultiRouteCodexFeishuService:
             logger.info("Ignoring message from unauthorized sender {} in route {}", message.sender_id, route.name)
             return
 
-        scope_key = self._build_scope_key(route, message)
-        task_key = f"{route.name}::{scope_key}"
+        chat_scope_key = self._build_scope_key(route, message)
+        task_key = f"{route.name}::{chat_scope_key}"
         input_bundle_key = self._build_input_bundle_key(message)
         raw_text = message.text.strip()
         command = raw_text.split(None, 1)[0].lower() if raw_text else ""
         if command == "/help":
             await self.bot.send_card(message.reply_target, "使用说明", self._build_help_text(route))
             return
+        if command in {"/ctx", "/context", "/contexts"}:
+            await self._handle_context_command(route, message, chat_scope_key, task_key, raw_text)
+            return
         if command in {"/status", "status"}:
             await self.bot.send_card(
                 message.reply_target,
                 "群状态",
-                self._build_status_text(route, scope_key, task_key, input_bundle_key),
+                self._build_status_text(route, chat_scope_key, task_key, input_bundle_key),
             )
             return
         if command == "/usage":
-            await self.bot.send_card(message.reply_target, "上下文用量", self._build_usage_text(route, scope_key))
+            await self.bot.send_card(message.reply_target, "上下文用量", self._build_usage_text(route, chat_scope_key))
             return
         if command == "/lastcmd":
-            await self.bot.send_card(message.reply_target, "上一条成功命令", self._build_last_command_text(route, scope_key))
+            await self.bot.send_card(message.reply_target, "上一条成功命令", self._build_last_command_text(route, chat_scope_key))
             return
         if command in {"/interrupt", "/stop", "/cancel"}:
             stopped = await self.runner.interrupt(task_key)
@@ -897,10 +1144,12 @@ class MultiRouteCodexFeishuService:
                 await self.bot.send_text(message.reply_target, "这个群里上一条任务还在跑，等它收工后我再帮你重开上下文。")
                 return
             await self._drop_input_bundle(input_bundle_key)
-            removed = self.sessions.clear(route, scope_key)
-            text = "这个群绑定的 Codex 上下文已经清空；你下一条消息会直接在同一路径下新开一轮。"
+            active_context = self.sessions.resolve_context(route, chat_scope_key)
+            removed = self.sessions.clear(route, str(active_context.get("scope_key") or chat_scope_key))
+            context_name = str(active_context.get("name") or DEFAULT_CONTEXT_NAME)
+            text = f"当前上下文 `{context_name}` 已清空；你下一条消息会在同一路径下重新开一轮。"
             if not removed:
-                text = "这个群目前还没有历史上下文；你下一条消息会直接新开一轮。"
+                text = f"当前上下文 `{context_name}` 目前还没有历史会话；你下一条消息会直接新开一轮。"
             await self.bot.send_card(message.reply_target, "上下文已重开", text)
             return
 
@@ -916,14 +1165,90 @@ class MultiRouteCodexFeishuService:
 
         await self._enqueue_task_message(route, message)
 
+    async def _handle_context_command(
+        self,
+        route: RouteConfig,
+        message: FeishuInboundMessage,
+        chat_scope_key: str,
+        task_key: str,
+        raw_text: str,
+    ) -> None:
+        parts = raw_text.split(None, 2)
+        action = parts[1].lower() if len(parts) > 1 else "list"
+        argument = parts[2].strip() if len(parts) > 2 else ""
+        if action in {"list", "ls"}:
+            await self.bot.send_card(message.reply_target, "上下文列表", self._build_contexts_text(route, chat_scope_key))
+            return
+        if action in {"new", "create"}:
+            if self._task_has_pending_work(task_key):
+                await self.bot.send_text(message.reply_target, "当前群里还有运行中或排队中的任务，等它们处理完再切换上下文。")
+                return
+            try:
+                context, created = self.sessions.create_context(route, chat_scope_key, argument)
+            except ValueError as exc:
+                await self.bot.send_text(message.reply_target, f"{exc}\n用法：`/ctx new 名称`")
+                return
+            title = "上下文已创建" if created else "上下文已切换"
+            await self.bot.send_card(message.reply_target, title, self._build_context_switch_text(route, context, created))
+            return
+        if action in {"use", "switch"}:
+            if self._task_has_pending_work(task_key):
+                await self.bot.send_text(message.reply_target, "当前群里还有运行中或排队中的任务，等它们处理完再切换上下文。")
+                return
+            contexts = self.sessions.list_contexts(route, chat_scope_key)
+            selected = self._select_context_entry(contexts, argument)
+            if selected is None:
+                await self.bot.send_text(
+                    message.reply_target,
+                    "没找到对应上下文。先发 `/ctx` 看编号，再用 `/ctx use 编号` 或 `/ctx use 名称` 切换。",
+                )
+                return
+            if bool(selected.get("active")):
+                await self.bot.send_card(message.reply_target, "当前上下文", self._build_context_switch_text(route, selected, False))
+                return
+            context = self.sessions.activate_context(route, chat_scope_key, str(selected.get("name") or ""))
+            if context is None:
+                await self.bot.send_text(message.reply_target, "切换失败：没有找到对应上下文。")
+                return
+            await self.bot.send_card(message.reply_target, "上下文已切换", self._build_context_switch_text(route, context, False))
+            return
+        await self.bot.send_text(
+            message.reply_target,
+            "用法：`/ctx` 查看列表，`/ctx use 编号` 切换，`/ctx new 名称` 新建并切换。",
+        )
+
+    def _task_has_pending_work(self, task_key: str) -> bool:
+        return bool(self._active_tasks.get(task_key) or self._pending_messages.get(task_key))
+
+    @staticmethod
+    def _select_context_entry(contexts: list[dict[str, Any]], selector: str) -> dict[str, Any] | None:
+        normalized = re.sub(r"\s+", " ", selector or "").strip()
+        if not normalized:
+            return None
+        if normalized.isdigit():
+            index = int(normalized)
+            if 1 <= index <= len(contexts):
+                return contexts[index - 1]
+        folded = normalized.casefold()
+        for context in contexts:
+            if str(context.get("name") or "").casefold() == folded:
+                return context
+        return None
+
     async def _enqueue_task_message(self, route: RouteConfig, message: FeishuInboundMessage) -> None:
-        scope_key = self._build_scope_key(route, message)
-        task_key = f"{route.name}::{scope_key}"
+        chat_scope_key = self._build_scope_key(route, message)
+        task_key = f"{route.name}::{chat_scope_key}"
+        context = self.sessions.resolve_context(route, chat_scope_key)
+        queued_task = QueuedTask(
+            message=message,
+            context_name=str(context.get("name") or DEFAULT_CONTEXT_NAME),
+            context_scope_key=str(context.get("scope_key") or chat_scope_key),
+        )
         should_start = False
         ahead_count = 0
         async with self._dispatch_lock:
             queue = self._pending_messages.setdefault(task_key, deque())
-            queue.append(message)
+            queue.append(queued_task)
             if self._active_tasks.get(task_key):
                 ahead_count = len(queue)
             else:
@@ -937,7 +1262,7 @@ class MultiRouteCodexFeishuService:
             )
             return
 
-        await self._drain_task_queue(route, scope_key, task_key)
+        await self._drain_task_queue(route, chat_scope_key, task_key)
 
     async def _stage_input_bundle(self, route: RouteConfig, message: FeishuInboundMessage, bundle_key: str) -> None:
         now = time.time()
@@ -1076,7 +1401,7 @@ class MultiRouteCodexFeishuService:
             attachments=list(bundle.attachments),
         )
 
-    async def _drain_task_queue(self, route: RouteConfig, scope_key: str, task_key: str) -> None:
+    async def _drain_task_queue(self, route: RouteConfig, chat_scope_key: str, task_key: str) -> None:
         try:
             while True:
                 async with self._dispatch_lock:
@@ -1085,10 +1410,10 @@ class MultiRouteCodexFeishuService:
                         self._pending_messages.pop(task_key, None)
                         self._active_tasks[task_key] = False
                         return
-                    message = queue.popleft()
+                    queued_task = queue.popleft()
                     if not queue:
                         self._pending_messages.pop(task_key, None)
-                await self._run_single_message(route, scope_key, task_key, message)
+                await self._run_single_message(route, chat_scope_key, task_key, queued_task)
         finally:
             async with self._dispatch_lock:
                 if not self._pending_messages.get(task_key):
@@ -1098,19 +1423,23 @@ class MultiRouteCodexFeishuService:
     async def _run_single_message(
         self,
         route: RouteConfig,
-        scope_key: str,
+        chat_scope_key: str,
         task_key: str,
-        message: FeishuInboundMessage,
+        queued_task: QueuedTask,
     ) -> None:
+        message = queued_task.message
+        context_scope_key = queued_task.context_scope_key
+        context_name = queued_task.context_name
         started_at = time.time()
-        downloads_dir = self.state_dir / "downloads" / route.name / self._scope_dir_name(scope_key)
+        downloads_dir = self.state_dir / "downloads" / route.name / self._scope_dir_name(context_scope_key)
         initial_progress = "任务已启动，正在等待 Codex 建立上下文。"
         self._running_meta[task_key] = {
             "started_at": int(started_at),
+            "context_name": context_name,
             "message_preview": self._message_preview(message),
             "progress_status": initial_progress,
         }
-        self._start_progress_tracking(route, task_key, message.reply_target, message, started_at)
+        self._start_progress_tracking(route, task_key, message.reply_target, message, started_at, context_name)
         try:
             downloaded_paths = await self._download_attachments(message.attachments, downloads_dir)
             include_bridge_preamble = self.backend != "app_server"
@@ -1120,7 +1449,7 @@ class MultiRouteCodexFeishuService:
                 include_bridge_preamble=include_bridge_preamble,
             )
             developer_instructions = self._build_thread_instructions() if self.backend == "app_server" else None
-            existing_session = self.sessions.get(route, scope_key)
+            existing_session = self.sessions.get(route, context_scope_key)
             result = await self.runner.run(
                 prompt=prompt,
                 route=route,
@@ -1131,12 +1460,18 @@ class MultiRouteCodexFeishuService:
                 developer_instructions=developer_instructions,
             )
             if result.session_id:
-                self.sessions.set(route, scope_key, result.session_id)
+                self.sessions.set(
+                    route,
+                    context_scope_key,
+                    result.session_id,
+                    chat_scope_key=chat_scope_key,
+                    context_name=context_name,
+                )
             usage = self._extract_turn_usage(result.event_lines)
             last_successful_command = self._extract_last_successful_command(result.event_lines)
             self.sessions.record_run(
                 route,
-                scope_key,
+                context_scope_key,
                 message_text=self._message_preview(message),
                 success=result.success,
                 usage=usage,
@@ -1204,6 +1539,7 @@ class MultiRouteCodexFeishuService:
         reply_target: str,
         message: FeishuInboundMessage,
         started_at: float,
+        context_name: str,
     ) -> None:
         if not route.show_progress:
             return
@@ -1212,6 +1548,7 @@ class MultiRouteCodexFeishuService:
             reply_target=reply_target,
             route_name=route.name,
             workdir=route.workdir,
+            context_name=context_name,
             message_preview=self._message_preview(message),
             started_at=started_at,
             show_delay_seconds=route.progress_delay_seconds,
@@ -1354,6 +1691,7 @@ class MultiRouteCodexFeishuService:
             [
                 f"**项目:** {state.route_name}",
                 f"**路径:** `{state.workdir}`",
+                f"**上下文:** `{state.context_name}`",
                 f"**状态:** {state.status}",
                 f"**已耗时:** {elapsed} 秒",
                 f"**任务:** {state.message_preview}",
@@ -1633,7 +1971,7 @@ class MultiRouteCodexFeishuService:
             [
                 "**FlyingCodex**",
                 "",
-                "这个服务会把当前飞书群固定映射到指定项目路径。一个群就是一个项目、一条连续上下文。",
+                "这个服务会把当前飞书群固定映射到指定项目路径。一个群就是一个项目，可以在同一路径下维护多个上下文。",
                 f"- 当前项目：`{route.name}`",
                 f"- 当前路径：`{route.workdir}`",
                 f"- 后端模式：`{self.backend}`",
@@ -1645,6 +1983,9 @@ class MultiRouteCodexFeishuService:
                 "- 同一个群里连续发多条消息：会自动排队，依次执行",
                 "- 长任务默认会在群里保留一张运行卡片，持续显示当前状态和耗时",
                 "- `/status`：查看当前路由、排队情况和待补充输入状态",
+                "- `/ctx`：查看当前项目下的上下文列表",
+                "- `/ctx use 编号`：切换到指定上下文",
+                "- `/ctx new 名称`：新建一个上下文并切过去",
                 "- `/usage`：查看当前上下文与当前项目累计 token 用量",
                 "- `/lastcmd`：查看上一条成功执行的 shell 命令",
                 "- `/interrupt`：中断当前正在运行的任务",
@@ -1660,15 +2001,60 @@ class MultiRouteCodexFeishuService:
             ]
         )
 
-    def _build_status_text(self, route: RouteConfig, scope_key: str, task_key: str, input_bundle_key: str) -> str:
+    def _build_contexts_text(self, route: RouteConfig, chat_scope_key: str) -> str:
+        contexts = self.sessions.list_contexts(route, chat_scope_key)
+        active_context = self.sessions.resolve_context(route, chat_scope_key)
+        lines = [
+            f"**项目:** {route.name}",
+            f"**路径:** `{route.workdir}`",
+            f"**当前选中上下文:** `{active_context.get('name') or DEFAULT_CONTEXT_NAME}`",
+            "",
+            "**上下文列表**",
+        ]
+        for index, context in enumerate(contexts, start=1):
+            marker = "（当前）" if context.get("active") else ""
+            status = "已建立" if context.get("has_session") else "未建立"
+            lines.append(f"{index}. `{context.get('name')}` {marker}".rstrip())
+            lines.append(
+                "   "
+                + f"状态：{status} | 最后更新：{self._format_time(context.get('updated_at'))} | "
+                + f"上一轮用量：{self._format_usage(context.get('last_usage'))}"
+            )
+        lines.extend(
+            [
+                "",
+                "**切换方式**",
+                "- `/ctx use 编号`：按序号切换",
+                "- `/ctx use 名称`：按名称切换",
+                "- `/ctx new 名称`：新建并切换到一个空上下文",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _build_context_switch_text(self, route: RouteConfig, context: dict[str, Any], created: bool) -> str:
+        name = str(context.get("name") or DEFAULT_CONTEXT_NAME)
+        has_session = bool(context.get("has_session"))
+        session_id = str(context.get("session_id") or "").strip() or "无"
+        status = "已建立，可直接续聊" if has_session else "还没有历史会话；你下一条消息会在这里新开一轮"
+        lines = [
+            f"**项目:** {route.name}",
+            f"**路径:** `{route.workdir}`",
+            f"**当前上下文:** `{name}`",
+            f"**状态:** {status}",
+            f"**线程 ID:** `{session_id}`",
+        ]
+        if created and not has_session:
+            lines.append("这个上下文刚创建完成，目前还是空的。")
+        return "\n".join(lines)
+
+    def _build_status_text(self, route: RouteConfig, chat_scope_key: str, task_key: str, input_bundle_key: str) -> str:
         active = self._active_tasks.get(task_key, False)
-        session = self.sessions.describe(route, scope_key)
+        active_context = self.sessions.resolve_context(route, chat_scope_key)
         pending_count = len(self._pending_messages.get(task_key) or ())
         running_meta = self._running_meta.get(task_key) or {}
         runtime_status = self.runner.route_status(route.name) or {}
         draft_summary, draft_preview = self._describe_input_bundle(input_bundle_key)
-        updated_at = session.get("updated_at") if isinstance(session, dict) else None
-        updated_line = self._format_time(updated_at)
+        updated_line = self._format_time(active_context.get("updated_at"))
         idle_timeout_seconds = int(runtime_status.get("idle_timeout_seconds") or 0)
         idle_for_seconds = int(runtime_status.get("idle_for_seconds") or 0)
         idle_remaining = max(0, idle_timeout_seconds - idle_for_seconds) if idle_timeout_seconds > 0 else 0
@@ -1688,26 +2074,29 @@ class MultiRouteCodexFeishuService:
                 f"**排队中消息数:** {pending_count}",
                 f"**待补充输入:** {draft_summary}",
                 f"**待补充内容:** {draft_preview}",
+                f"**当前选中上下文:** `{active_context.get('name') or DEFAULT_CONTEXT_NAME}`",
+                f"**当前运行上下文:** `{running_meta.get('context_name') or '无'}`",
                 f"**当前运行开始于:** {self._format_time(running_meta.get('started_at'))}",
                 f"**当前运行内容:** {running_meta.get('message_preview') or '无'}",
-                f"**当前上下文:** {'已建立' if session else '未建立'}",
+                f"**当前上下文状态:** {'已建立' if active_context.get('has_session') else '未建立'}",
                 "",
-                f"**终端接续用线程 ID:** `{session.get('session_id') if isinstance(session, dict) and session.get('session_id') else '无'}`",
+                f"**终端接续用线程 ID:** `{active_context.get('session_id') or '无'}`",
                 "",
                 f"**上次更新时间:** {updated_line}",
-                f"**当前项目已保存上下文数:** {self.sessions.count(route)}",
+                f"**当前项目已保存上下文数:** {self.sessions.count_contexts(route)}",
             ]
         )
 
-    def _build_usage_text(self, route: RouteConfig, scope_key: str) -> str:
-        scope_metrics = self.sessions.describe_scope_metrics(route, scope_key) or {}
+    def _build_usage_text(self, route: RouteConfig, chat_scope_key: str) -> str:
+        active_context = self.sessions.resolve_context(route, chat_scope_key)
+        scope_metrics = self.sessions.describe_scope_metrics(route, str(active_context.get("scope_key") or chat_scope_key)) or {}
         route_metrics = self.sessions.describe_route_metrics(route) or {}
         return "\n".join(
             [
                 f"**项目:** {route.name}",
                 f"**路径:** `{route.workdir}`",
                 "",
-                "**当前上下文**",
+                f"**当前上下文:** `{active_context.get('name') or DEFAULT_CONTEXT_NAME}`",
                 f"- 任务数：{int(scope_metrics.get('task_count') or 0)}",
                 f"- 成功 / 失败：{int(scope_metrics.get('success_count') or 0)} / {int(scope_metrics.get('failure_count') or 0)}",
                 f"- 上一轮用量：{self._format_usage(scope_metrics.get('last_usage'))}",
@@ -1723,14 +2112,16 @@ class MultiRouteCodexFeishuService:
             ]
         )
 
-    def _build_last_command_text(self, route: RouteConfig, scope_key: str) -> str:
-        scope_metrics = self.sessions.describe_scope_metrics(route, scope_key) or {}
+    def _build_last_command_text(self, route: RouteConfig, chat_scope_key: str) -> str:
+        active_context = self.sessions.resolve_context(route, chat_scope_key)
+        scope_metrics = self.sessions.describe_scope_metrics(route, str(active_context.get("scope_key") or chat_scope_key)) or {}
         route_metrics = self.sessions.describe_route_metrics(route) or {}
         command_info = scope_metrics.get("last_successful_command") or route_metrics.get("last_successful_command")
         if not isinstance(command_info, dict) or not str(command_info.get("command") or "").strip():
             return "暂时还没有记录到成功执行过的 shell 命令。"
         output = str(command_info.get("output") or "").strip()
         parts = [
+            f"**上下文:** `{active_context.get('name') or DEFAULT_CONTEXT_NAME}`",
             f"**时间:** {self._format_time(command_info.get('updated_at'))}",
             f"**命令:**\n```bash\n{command_info.get('command')}\n```",
             f"**退出码:** {int(command_info.get('exit_code') or 0)}",
